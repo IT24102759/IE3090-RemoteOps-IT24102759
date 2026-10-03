@@ -10,7 +10,9 @@
 #define AUTH_TOKEN "OPS-2759"
 #define SID "9572"
 
-/* Send the complete response */
+/*
+ * Send the complete response
+ */
 int send_response(int client_socket, const char *response)
 {
     size_t total_sent = 0;
@@ -34,12 +36,103 @@ int send_response(int client_socket, const char *response)
     return 0;
 }
 
-/* Process one complete command */
+/*
+ * Read current system information from Linux /proc.
+ *
+ * CPU load:
+ *     First value from /proc/loadavg
+ *
+ * Memory usage:
+ *     MemTotal - MemAvailable from /proc/meminfo
+ *
+ * Uptime:
+ *     First value from /proc/uptime
+ */
+void get_system_info(double *cpu_load,
+                     unsigned long *memory_used_mb,
+                     unsigned long *uptime_sec)
+{
+    FILE *file;
+
+    *cpu_load = 0.0;
+    *memory_used_mb = 0;
+    *uptime_sec = 0;
+
+    /*
+     * Get CPU load
+     */
+    file = fopen("/proc/loadavg", "r");
+
+    if (file != NULL)
+    {
+        fscanf(file, "%lf", cpu_load);
+        fclose(file);
+    }
+
+    /*
+     * Get memory usage
+     */
+    unsigned long mem_total_kb = 0;
+    unsigned long mem_available_kb = 0;
+
+    file = fopen("/proc/meminfo", "r");
+
+    if (file != NULL)
+    {
+        char line[256];
+
+        while (fgets(line, sizeof(line), file) != NULL)
+        {
+            if (sscanf(line,
+                       "MemTotal: %lu kB",
+                       &mem_total_kb) == 1)
+            {
+                continue;
+            }
+
+            if (sscanf(line,
+                       "MemAvailable: %lu kB",
+                       &mem_available_kb) == 1)
+            {
+                continue;
+            }
+        }
+
+        fclose(file);
+    }
+
+    if (mem_total_kb >= mem_available_kb)
+    {
+        *memory_used_mb =
+            (mem_total_kb - mem_available_kb) / 1024;
+    }
+
+    /*
+     * Get system uptime
+     */
+    double uptime_seconds = 0.0;
+
+    file = fopen("/proc/uptime", "r");
+
+    if (file != NULL)
+    {
+        fscanf(file, "%lf", &uptime_seconds);
+        fclose(file);
+    }
+
+    *uptime_sec = (unsigned long)uptime_seconds;
+}
+
+/*
+ * Process one complete command
+ */
 int process_command(int client_socket,
                     char *command,
                     int *authenticated)
 {
-    /* Remove trailing CR if command came as CRLF */
+    /*
+     * Remove trailing CR if command uses CRLF
+     */
     size_t length = strlen(command);
 
     if (length > 0 && command[length - 1] == '\r')
@@ -50,8 +143,7 @@ int process_command(int client_socket,
     printf("Received: %s\n", command);
 
     /*
-     * Authentication must happen before
-     * any other command.
+     * Authentication must happen first.
      */
     if (!(*authenticated))
     {
@@ -106,9 +198,8 @@ int process_command(int client_socket,
     }
 
     /*
-     * Commands allowed after authentication
+     * QUIT
      */
-
     if (strcmp(command, "QUIT") == 0)
     {
         char response[128];
@@ -126,11 +217,38 @@ int process_command(int client_socket,
     }
 
     /*
-     * These commands will be implemented
+     * SYSINFO
+     */
+    if (strcmp(command, "SYSINFO") == 0)
+    {
+        double cpu_load;
+        unsigned long memory_used_mb;
+        unsigned long uptime_sec;
+
+        get_system_info(&cpu_load,
+                        &memory_used_mb,
+                        &uptime_sec);
+
+        char response[256];
+
+        snprintf(response,
+                 sizeof(response),
+                 "OK SYSINFO %.2f %lu %lu SID:%s\n",
+                 cpu_load,
+                 memory_used_mb,
+                 uptime_sec,
+                 SID);
+
+        send_response(client_socket, response);
+
+        return 0;
+    }
+
+    /*
+     * Commands that will be implemented
      * in later commits.
      */
-    if (strcmp(command, "SYSINFO") == 0 ||
-        strcmp(command, "LISTPROC") == 0 ||
+    if (strcmp(command, "LISTPROC") == 0 ||
         strncmp(command, "EXEC ", 5) == 0 ||
         strncmp(command, "PUT ", 4) == 0 ||
         strncmp(command, "GET ", 4) == 0 ||
@@ -179,7 +297,9 @@ int main(void)
     /*
      * Create TCP socket
      */
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    server_socket = socket(AF_INET,
+                           SOCK_STREAM,
+                           0);
 
     if (server_socket < 0)
     {
@@ -206,7 +326,9 @@ int main(void)
     /*
      * Configure server address
      */
-    memset(&server_address, 0, sizeof(server_address));
+    memset(&server_address,
+           0,
+           sizeof(server_address));
 
     server_address.sin_family = AF_INET;
     server_address.sin_addr.s_addr = INADDR_ANY;
@@ -259,10 +381,7 @@ int main(void)
         int connection_open = 1;
 
         /*
-         * Buffer for TCP stream data.
-         *
-         * TCP does not guarantee that one recv()
-         * equals one command.
+         * TCP input buffer
          */
         char input_buffer[BUFFER_SIZE];
 
@@ -272,10 +391,11 @@ int main(void)
         {
             char recv_buffer[1024];
 
-            ssize_t bytes_received = recv(client_socket,
-                                          recv_buffer,
-                                          sizeof(recv_buffer),
-                                          0);
+            ssize_t bytes_received =
+                recv(client_socket,
+                     recv_buffer,
+                     sizeof(recv_buffer),
+                     0);
 
             if (bytes_received < 0)
             {
@@ -320,11 +440,7 @@ int main(void)
             input_buffer[input_length] = '\0';
 
             /*
-             * Process every complete line.
-             *
-             * This handles:
-             * 1. Partial commands
-             * 2. Multiple commands in one recv()
+             * Process every complete line
              */
             while (1)
             {
