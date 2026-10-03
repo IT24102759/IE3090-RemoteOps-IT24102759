@@ -6,73 +6,248 @@
 #include <sys/socket.h>
 
 #define PORT 9410
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 #define AUTH_TOKEN "OPS-2759"
 #define SID "9572"
 
+/* Send the complete response */
+int send_response(int client_socket, const char *response)
+{
+    size_t total_sent = 0;
+    size_t length = strlen(response);
+
+    while (total_sent < length)
+    {
+        ssize_t sent = send(client_socket,
+                            response + total_sent,
+                            length - total_sent,
+                            0);
+
+        if (sent <= 0)
+        {
+            return -1;
+        }
+
+        total_sent += sent;
+    }
+
+    return 0;
+}
+
+/* Process one complete command */
+int process_command(int client_socket,
+                    char *command,
+                    int *authenticated)
+{
+    /* Remove trailing CR if command came as CRLF */
+    size_t length = strlen(command);
+
+    if (length > 0 && command[length - 1] == '\r')
+    {
+        command[length - 1] = '\0';
+    }
+
+    printf("Received: %s\n", command);
+
+    /*
+     * Authentication must happen before
+     * any other command.
+     */
+    if (!(*authenticated))
+    {
+        if (strncmp(command, "AUTH ", 5) == 0)
+        {
+            char *token = command + 5;
+
+            if (strcmp(token, AUTH_TOKEN) == 0)
+            {
+                *authenticated = 1;
+
+                printf("Authentication successful.\n");
+
+                char response[128];
+
+                snprintf(response,
+                         sizeof(response),
+                         "OK AUTHENTICATED SID:%s\n",
+                         SID);
+
+                send_response(client_socket, response);
+
+                return 0;
+            }
+            else
+            {
+                char response[128];
+
+                snprintf(response,
+                         sizeof(response),
+                         "ERR 001 AUTH_FAILED SID:%s\n",
+                         SID);
+
+                send_response(client_socket, response);
+
+                return 0;
+            }
+        }
+        else
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 002 AUTH_REQUIRED SID:%s\n",
+                     SID);
+
+            send_response(client_socket, response);
+
+            return 0;
+        }
+    }
+
+    /*
+     * Commands allowed after authentication
+     */
+
+    if (strcmp(command, "QUIT") == 0)
+    {
+        char response[128];
+
+        snprintf(response,
+                 sizeof(response),
+                 "OK BYE SID:%s\n",
+                 SID);
+
+        send_response(client_socket, response);
+
+        printf("Controller requested disconnect.\n");
+
+        return 1;
+    }
+
+    /*
+     * These commands will be implemented
+     * in later commits.
+     */
+    if (strcmp(command, "SYSINFO") == 0 ||
+        strcmp(command, "LISTPROC") == 0 ||
+        strncmp(command, "EXEC ", 5) == 0 ||
+        strncmp(command, "PUT ", 4) == 0 ||
+        strncmp(command, "GET ", 4) == 0 ||
+        strcmp(command, "MONITOR START") == 0 ||
+        strcmp(command, "MONITOR STOP") == 0)
+    {
+        char response[128];
+
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 004 NOT_IMPLEMENTED SID:%s\n",
+                 SID);
+
+        send_response(client_socket, response);
+
+        return 0;
+    }
+
+    /*
+     * Unknown command
+     */
+    {
+        char response[128];
+
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 003 UNKNOWN_COMMAND SID:%s\n",
+                 SID);
+
+        send_response(client_socket, response);
+    }
+
+    return 0;
+}
+
 int main(void)
 {
-    int server_fd;
-    int client_fd;
+    int server_socket;
+    int client_socket;
 
-    struct sockaddr_in server_addr;
-    struct sockaddr_in client_addr;
+    struct sockaddr_in server_address;
+    struct sockaddr_in client_address;
 
-    socklen_t client_len = sizeof(client_addr);
+    socklen_t client_length = sizeof(client_address);
 
-    char buffer[BUFFER_SIZE];
+    /*
+     * Create TCP socket
+     */
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-
-    if (server_fd < 0)
+    if (server_socket < 0)
     {
         perror("socket");
         return 1;
     }
 
-    int opt = 1;
+    /*
+     * Allow port reuse
+     */
+    int option = 1;
 
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
-                   &opt, sizeof(opt)) < 0)
+    if (setsockopt(server_socket,
+                   SOL_SOCKET,
+                   SO_REUSEADDR,
+                   &option,
+                   sizeof(option)) < 0)
     {
         perror("setsockopt");
-        close(server_fd);
+        close(server_socket);
         return 1;
     }
 
-    memset(&server_addr, 0, sizeof(server_addr));
+    /*
+     * Configure server address
+     */
+    memset(&server_address, 0, sizeof(server_address));
 
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = INADDR_ANY;
+    server_address.sin_port = htons(PORT);
 
-    if (bind(server_fd,
-             (struct sockaddr *)&server_addr,
-             sizeof(server_addr)) < 0)
+    /*
+     * Bind socket
+     */
+    if (bind(server_socket,
+             (struct sockaddr *)&server_address,
+             sizeof(server_address)) < 0)
     {
         perror("bind");
-        close(server_fd);
+        close(server_socket);
         return 1;
     }
 
-    if (listen(server_fd, 5) < 0)
+    /*
+     * Start listening
+     */
+    if (listen(server_socket, 5) < 0)
     {
         perror("listen");
-        close(server_fd);
+        close(server_socket);
         return 1;
     }
 
     printf("RemoteOps Agent listening on TCP port %d...\n", PORT);
 
+    /*
+     * Accept Controllers continuously
+     */
     while (1)
     {
         printf("Waiting for Controller connection...\n");
 
-        client_fd = accept(server_fd,
-                           (struct sockaddr *)&client_addr,
-                           &client_len);
+        client_socket = accept(server_socket,
+                               (struct sockaddr *)&client_address,
+                               &client_length);
 
-        if (client_fd < 0)
+        if (client_socket < 0)
         {
             perror("accept");
             continue;
@@ -81,101 +256,137 @@ int main(void)
         printf("Controller connected.\n");
 
         int authenticated = 0;
+        int connection_open = 1;
 
         /*
-         * Wait for the first command.
-         * The first command must be AUTH.
+         * Buffer for TCP stream data.
+         *
+         * TCP does not guarantee that one recv()
+         * equals one command.
          */
-        memset(buffer, 0, sizeof(buffer));
+        char input_buffer[BUFFER_SIZE];
 
-        ssize_t bytes_received =
-            recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+        size_t input_length = 0;
 
-        if (bytes_received <= 0)
+        while (connection_open)
         {
-            close(client_fd);
-            continue;
-        }
+            char recv_buffer[1024];
 
-        buffer[bytes_received] = '\0';
+            ssize_t bytes_received = recv(client_socket,
+                                          recv_buffer,
+                                          sizeof(recv_buffer),
+                                          0);
 
-        printf("Received: %s", buffer);
-
-        /*
-         * Check AUTH command.
-         */
-        char received_token[BUFFER_SIZE];
-
-        if (sscanf(buffer, "AUTH %1023s", received_token) == 1)
-        {
-            if (strcmp(received_token, AUTH_TOKEN) == 0)
+            if (bytes_received < 0)
             {
-                authenticated = 1;
+                perror("recv");
+                break;
+            }
 
-                char response[BUFFER_SIZE];
+            if (bytes_received == 0)
+            {
+                printf("Controller disconnected.\n");
+                break;
+            }
+
+            /*
+             * Prevent buffer overflow
+             */
+            if (input_length + bytes_received >= BUFFER_SIZE)
+            {
+                char response[128];
 
                 snprintf(response,
                          sizeof(response),
-                         "OK AUTHENTICATED SID:%s\n",
+                         "ERR 005 INPUT_TOO_LARGE SID:%s\n",
                          SID);
 
-                send(client_fd,
-                     response,
-                     strlen(response),
-                     0);
+                send_response(client_socket, response);
 
-                printf("Authentication successful.\n");
+                input_length = 0;
+
+                continue;
             }
-            else
+
+            /*
+             * Add received data to input buffer
+             */
+            memcpy(input_buffer + input_length,
+                   recv_buffer,
+                   bytes_received);
+
+            input_length += bytes_received;
+
+            input_buffer[input_length] = '\0';
+
+            /*
+             * Process every complete line.
+             *
+             * This handles:
+             * 1. Partial commands
+             * 2. Multiple commands in one recv()
+             */
+            while (1)
             {
-                char response[BUFFER_SIZE];
+                char *newline_position =
+                    memchr(input_buffer,
+                           '\n',
+                           input_length);
 
-                snprintf(response,
-                         sizeof(response),
-                         "ERR 001 AUTH_FAILED SID:%s\n",
-                         SID);
+                if (newline_position == NULL)
+                {
+                    break;
+                }
 
-                send(client_fd,
-                     response,
-                     strlen(response),
-                     0);
+                size_t command_length =
+                    newline_position - input_buffer;
 
-                printf("Authentication failed.\n");
+                char command[BUFFER_SIZE];
+
+                memcpy(command,
+                       input_buffer,
+                       command_length);
+
+                command[command_length] = '\0';
+
+                /*
+                 * Remove processed command
+                 * from input buffer.
+                 */
+                size_t remaining =
+                    input_length -
+                    (command_length + 1);
+
+                memmove(input_buffer,
+                        newline_position + 1,
+                        remaining);
+
+                input_length = remaining;
+
+                input_buffer[input_length] = '\0';
+
+                /*
+                 * Process command
+                 */
+                int result =
+                    process_command(client_socket,
+                                    command,
+                                    &authenticated);
+
+                if (result == 1)
+                {
+                    connection_open = 0;
+                    break;
+                }
             }
         }
-        else
-        {
-            char response[BUFFER_SIZE];
 
-            snprintf(response,
-                     sizeof(response),
-                     "ERR 001 AUTH_FAILED SID:%s\n",
-                     SID);
+        close(client_socket);
 
-            send(client_fd,
-                 response,
-                 strlen(response),
-                 0);
-
-            printf("First command was not AUTH.\n");
-        }
-
-        /*
-         * For now, close the connection after authentication test.
-         * Later we will keep this connection open and process
-         * SYSINFO, LISTPROC, EXEC, PUT, GET, MONITOR and QUIT.
-         */
-        if (authenticated)
-        {
-            printf("Controller authenticated.\n");
-        }
-
-        close(client_fd);
-
-        printf("Controller disconnected.\n");
+        printf("Controller session closed.\n");
     }
 
-    close(server_fd);
+    close(server_socket);
 
     return 0;
 }
