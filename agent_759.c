@@ -115,14 +115,7 @@ void get_system_info(double *cpu_load,
 }
 
 /*
- * Get currently running processes.
- *
- * The assignment allows using ps for a simple
- * process snapshot.
- *
- * Output example:
- *
- * 1/systemd,2/kthreadd,3/rcu_gp,...
+ * Get currently running processes
  */
 int get_process_list(char *process_list,
                      size_t buffer_size)
@@ -140,7 +133,6 @@ int get_process_list(char *process_list,
     process_list[0] = '\0';
 
     char line[256];
-
     size_t used = 0;
 
     while (fgets(line, sizeof(line), process_pipe) != NULL)
@@ -156,15 +148,8 @@ int get_process_list(char *process_list,
             continue;
         }
 
-        /*
-         * Remove trailing newline if present
-         */
         process_name[strcspn(process_name, "\r\n")] = '\0';
 
-        /*
-         * Format:
-         * PID/process_name
-         */
         char entry[160];
 
         snprintf(entry,
@@ -175,13 +160,6 @@ int get_process_list(char *process_list,
 
         size_t entry_length = strlen(entry);
 
-        /*
-         * Leave room for:
-         * comma
-         * SID
-         * newline
-         * null terminator
-         */
         if (used + entry_length + 2 >= buffer_size)
         {
             break;
@@ -199,6 +177,86 @@ int get_process_list(char *process_list,
     }
 
     pclose(process_pipe);
+
+    return 0;
+}
+
+/*
+ * Execute one of the five allowed commands.
+ *
+ * Allowed:
+ * DATE
+ * UPTIME
+ * DISKFREE
+ * HOSTNAME
+ * WHOAMI
+ */
+int execute_allowed_command(const char *command,
+                            char *output,
+                            size_t output_size)
+{
+    const char *shell_command = NULL;
+
+    if (strcmp(command, "DATE") == 0)
+    {
+        shell_command = "date";
+    }
+    else if (strcmp(command, "UPTIME") == 0)
+    {
+        shell_command = "uptime";
+    }
+    else if (strcmp(command, "DISKFREE") == 0)
+    {
+        shell_command = "df -h / | tail -1";
+    }
+    else if (strcmp(command, "HOSTNAME") == 0)
+    {
+        shell_command = "hostname";
+    }
+    else if (strcmp(command, "WHOAMI") == 0)
+    {
+        shell_command = "whoami";
+    }
+    else
+    {
+        return -1;
+    }
+
+    FILE *command_pipe = popen(shell_command, "r");
+
+    if (command_pipe == NULL)
+    {
+        return -2;
+    }
+
+    output[0] = '\0';
+
+    if (fgets(output,
+              output_size,
+              command_pipe) == NULL)
+    {
+        pclose(command_pipe);
+        return -2;
+    }
+
+    pclose(command_pipe);
+
+    /*
+     * The protocol requires one-line responses.
+     */
+    output[strcspn(output, "\r\n")] = '\0';
+
+    /*
+     * Replace any remaining newline characters
+     * just in case.
+     */
+    for (size_t i = 0; output[i] != '\0'; i++)
+    {
+        if (output[i] == '\n' || output[i] == '\r')
+        {
+            output[i] = ' ';
+        }
+    }
 
     return 0;
 }
@@ -360,11 +418,91 @@ int process_command(int client_socket,
     }
 
     /*
+     * EXEC
+     */
+    if (strncmp(command, "EXEC ", 5) == 0)
+    {
+        char *command_name = command + 5;
+
+        /*
+         * Reject empty EXEC command
+         */
+        if (strlen(command_name) == 0)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 002 COMMAND_NOT_ALLOWED SID:%s\n",
+                     SID);
+
+            send_response(client_socket, response);
+
+            return 0;
+        }
+
+        char output[512];
+
+        int result =
+            execute_allowed_command(command_name,
+                                    output,
+                                    sizeof(output));
+
+        /*
+         * Command is not in the whitelist
+         */
+        if (result == -1)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 002 COMMAND_NOT_ALLOWED SID:%s\n",
+                     SID);
+
+            send_response(client_socket, response);
+
+            return 0;
+        }
+
+        /*
+         * Execution failed
+         */
+        if (result == -2)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 006 EXEC_FAILED SID:%s\n",
+                     SID);
+
+            send_response(client_socket, response);
+
+            return 0;
+        }
+
+        /*
+         * Successful execution
+         */
+        char response[BUFFER_SIZE];
+
+        snprintf(response,
+                 sizeof(response),
+                 "OK EXEC_RESULT %s SID:%s\n",
+                 output,
+                 SID);
+
+        send_response(client_socket, response);
+
+        return 0;
+    }
+
+    /*
      * Commands that will be implemented
      * in later commits.
      */
-    if (strncmp(command, "EXEC ", 5) == 0 ||
-        strncmp(command, "PUT ", 4) == 0 ||
+    if (strncmp(command, "PUT ", 4) == 0 ||
         strncmp(command, "GET ", 4) == 0 ||
         strcmp(command, "MONITOR START") == 0 ||
         strcmp(command, "MONITOR STOP") == 0)
