@@ -37,16 +37,7 @@ int send_response(int client_socket, const char *response)
 }
 
 /*
- * Read current system information from Linux /proc.
- *
- * CPU load:
- *     First value from /proc/loadavg
- *
- * Memory usage:
- *     MemTotal - MemAvailable from /proc/meminfo
- *
- * Uptime:
- *     First value from /proc/uptime
+ * Get current system information from Linux /proc
  */
 void get_system_info(double *cpu_load,
                      unsigned long *memory_used_mb,
@@ -59,7 +50,7 @@ void get_system_info(double *cpu_load,
     *uptime_sec = 0;
 
     /*
-     * Get CPU load
+     * CPU load
      */
     file = fopen("/proc/loadavg", "r");
 
@@ -70,7 +61,7 @@ void get_system_info(double *cpu_load,
     }
 
     /*
-     * Get memory usage
+     * Memory usage
      */
     unsigned long mem_total_kb = 0;
     unsigned long mem_available_kb = 0;
@@ -108,7 +99,7 @@ void get_system_info(double *cpu_load,
     }
 
     /*
-     * Get system uptime
+     * System uptime
      */
     double uptime_seconds = 0.0;
 
@@ -121,6 +112,95 @@ void get_system_info(double *cpu_load,
     }
 
     *uptime_sec = (unsigned long)uptime_seconds;
+}
+
+/*
+ * Get currently running processes.
+ *
+ * The assignment allows using ps for a simple
+ * process snapshot.
+ *
+ * Output example:
+ *
+ * 1/systemd,2/kthreadd,3/rcu_gp,...
+ */
+int get_process_list(char *process_list,
+                     size_t buffer_size)
+{
+    FILE *process_pipe;
+
+    process_pipe =
+        popen("ps -eo pid=,comm= --no-headers", "r");
+
+    if (process_pipe == NULL)
+    {
+        return -1;
+    }
+
+    process_list[0] = '\0';
+
+    char line[256];
+
+    size_t used = 0;
+
+    while (fgets(line, sizeof(line), process_pipe) != NULL)
+    {
+        int pid;
+        char process_name[128];
+
+        if (sscanf(line,
+                   "%d %127s",
+                   &pid,
+                   process_name) != 2)
+        {
+            continue;
+        }
+
+        /*
+         * Remove trailing newline if present
+         */
+        process_name[strcspn(process_name, "\r\n")] = '\0';
+
+        /*
+         * Format:
+         * PID/process_name
+         */
+        char entry[160];
+
+        snprintf(entry,
+                 sizeof(entry),
+                 "%d/%s",
+                 pid,
+                 process_name);
+
+        size_t entry_length = strlen(entry);
+
+        /*
+         * Leave room for:
+         * comma
+         * SID
+         * newline
+         * null terminator
+         */
+        if (used + entry_length + 2 >= buffer_size)
+        {
+            break;
+        }
+
+        if (used > 0)
+        {
+            process_list[used++] = ',';
+            process_list[used] = '\0';
+        }
+
+        strcat(process_list, entry);
+
+        used += entry_length;
+    }
+
+    pclose(process_pipe);
+
+    return 0;
 }
 
 /*
@@ -245,11 +325,45 @@ int process_command(int client_socket,
     }
 
     /*
+     * LISTPROC
+     */
+    if (strcmp(command, "LISTPROC") == 0)
+    {
+        char process_list[3000];
+
+        if (get_process_list(process_list,
+                             sizeof(process_list)) != 0)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 003 PROCESS_LIST_FAILED SID:%s\n",
+                     SID);
+
+            send_response(client_socket, response);
+
+            return 0;
+        }
+
+        char response[BUFFER_SIZE];
+
+        snprintf(response,
+                 sizeof(response),
+                 "OK PROCS %s SID:%s\n",
+                 process_list,
+                 SID);
+
+        send_response(client_socket, response);
+
+        return 0;
+    }
+
+    /*
      * Commands that will be implemented
      * in later commits.
      */
-    if (strcmp(command, "LISTPROC") == 0 ||
-        strncmp(command, "EXEC ", 5) == 0 ||
+    if (strncmp(command, "EXEC ", 5) == 0 ||
         strncmp(command, "PUT ", 4) == 0 ||
         strncmp(command, "GET ", 4) == 0 ||
         strcmp(command, "MONITOR START") == 0 ||
