@@ -4,32 +4,29 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #define SERVER_PORT 9410
 #define SERVER_IP "127.0.0.1"
-
 #define BUFFER_SIZE 4096
 #define AUTH_TOKEN "OPS-2759"
 
-/*
- * Send the complete command
- */
-int send_command(int socket_fd, const char *command)
+int send_all(int socket_fd,
+             const unsigned char *data,
+             size_t length)
 {
     size_t total_sent = 0;
-    size_t length = strlen(command);
 
     while (total_sent < length)
     {
-        ssize_t sent = send(socket_fd,
-                            command + total_sent,
-                            length - total_sent,
-                            0);
+        ssize_t sent =
+            send(socket_fd,
+                 data + total_sent,
+                 length - total_sent,
+                 0);
 
         if (sent <= 0)
-        {
             return -1;
-        }
 
         total_sent += sent;
     }
@@ -37,12 +34,6 @@ int send_command(int socket_fd, const char *command)
     return 0;
 }
 
-/*
- * Receive one response line.
- *
- * TCP may deliver a response in multiple pieces,
- * so continue receiving until '\n' is found.
- */
 int receive_response(int socket_fd,
                      char *buffer,
                      size_t buffer_size)
@@ -60,21 +51,111 @@ int receive_response(int socket_fd,
                  0);
 
         if (bytes <= 0)
-        {
             return -1;
-        }
 
         buffer[received++] = character;
 
         if (character == '\n')
-        {
             break;
-        }
     }
 
     buffer[received] = '\0';
 
     return 0;
+}
+
+int upload_file(int socket_fd,
+                const char *filename)
+{
+    FILE *file = fopen(filename, "rb");
+
+    if (file == NULL)
+    {
+        perror("fopen");
+        return 0;
+    }
+
+    fseek(file, 0, SEEK_END);
+
+    long file_size = ftell(file);
+
+    fseek(file, 0, SEEK_SET);
+
+    if (file_size < 0)
+    {
+        fclose(file);
+        return 0;
+    }
+
+    /*
+     * Build PUT header.
+     */
+    char header[512];
+
+    snprintf(header,
+             sizeof(header),
+             "PUT %s %ld\n",
+             filename,
+             file_size);
+
+    printf("Controller: PUT %s (%ld bytes)\n",
+           filename,
+           file_size);
+
+    /*
+     * Send header.
+     */
+    if (send_all(socket_fd,
+                 (unsigned char *)header,
+                 strlen(header)) < 0)
+    {
+        fclose(file);
+        return 0;
+    }
+
+    /*
+     * Send exact file bytes.
+     */
+    unsigned char buffer[4096];
+
+    size_t total_sent = 0;
+
+    while (total_sent < (size_t)file_size)
+    {
+        size_t remaining =
+            (size_t)file_size - total_sent;
+
+        size_t to_read =
+            remaining < sizeof(buffer)
+                ? remaining
+                : sizeof(buffer);
+
+        size_t bytes_read =
+            fread(buffer,
+                  1,
+                  to_read,
+                  file);
+
+        if (bytes_read == 0)
+        {
+            fclose(file);
+            return 0;
+        }
+
+        if (send_all(socket_fd,
+                     buffer,
+                     bytes_read) < 0)
+        {
+            fclose(file);
+            return 0;
+        }
+
+        total_sent += bytes_read;
+    }
+
+    fclose(file);
+
+    return 1;
 }
 
 int main(void)
@@ -83,12 +164,10 @@ int main(void)
 
     struct sockaddr_in server_address;
 
-    /*
-     * Create TCP socket
-     */
-    socket_fd = socket(AF_INET,
-                       SOCK_STREAM,
-                       0);
+    socket_fd =
+        socket(AF_INET,
+               SOCK_STREAM,
+               0);
 
     if (socket_fd < 0)
     {
@@ -96,9 +175,6 @@ int main(void)
         return 1;
     }
 
-    /*
-     * Configure server address
-     */
     memset(&server_address,
            0,
            sizeof(server_address));
@@ -115,9 +191,6 @@ int main(void)
         return 1;
     }
 
-    /*
-     * Connect to Agent
-     */
     if (connect(socket_fd,
                 (struct sockaddr *)&server_address,
                 sizeof(server_address)) < 0)
@@ -130,7 +203,7 @@ int main(void)
     printf("Connected to RemoteOps Agent.\n");
 
     /*
-     * Authentication
+     * Authenticate.
      */
     char auth_command[128];
 
@@ -139,14 +212,12 @@ int main(void)
              "AUTH %s\n",
              AUTH_TOKEN);
 
-    printf("Controller: AUTH %s\n", AUTH_TOKEN);
+    printf("Controller: AUTH %s\n",
+           AUTH_TOKEN);
 
-    if (send_command(socket_fd, auth_command) < 0)
-    {
-        perror("send");
-        close(socket_fd);
-        return 1;
-    }
+    send_all(socket_fd,
+             (unsigned char *)auth_command,
+             strlen(auth_command));
 
     char response[BUFFER_SIZE];
 
@@ -162,7 +233,7 @@ int main(void)
     printf("Agent: %s", response);
 
     /*
-     * Interactive command loop
+     * Interactive commands.
      */
     char command[BUFFER_SIZE];
 
@@ -178,21 +249,49 @@ int main(void)
             break;
         }
 
-        /*
-         * Remove newline from user input
-         */
         command[strcspn(command, "\n")] = '\0';
 
-        /*
-         * Ignore empty commands
-         */
         if (strlen(command) == 0)
+            continue;
+
+        /*
+         * PUT is handled separately because
+         * raw file bytes follow the header.
+         */
+        if (strncmp(command, "PUT ", 4) == 0)
         {
+            char filename[256];
+
+            if (sscanf(command + 4,
+                       "%255s",
+                       filename) != 1)
+            {
+                printf("Usage: PUT <filename>\n");
+                continue;
+            }
+
+            if (!upload_file(socket_fd,
+                             filename))
+            {
+                printf("File upload failed.\n");
+                continue;
+            }
+
+            if (receive_response(socket_fd,
+                                 response,
+                                 sizeof(response)) < 0)
+            {
+                printf("Agent disconnected.\n");
+                break;
+            }
+
+            printf("Agent: %s", response);
+
             continue;
         }
 
         /*
-         * Add protocol newline
+         * Normal text command.
          */
         char command_to_send[BUFFER_SIZE + 2];
 
@@ -201,18 +300,17 @@ int main(void)
                  "%s\n",
                  command);
 
-        printf("Controller: %s\n", command);
+        printf("Controller: %s\n",
+               command);
 
-        if (send_command(socket_fd,
-                         command_to_send) < 0)
+        if (send_all(socket_fd,
+                     (unsigned char *)command_to_send,
+                     strlen(command_to_send)) < 0)
         {
             perror("send");
             break;
         }
 
-        /*
-         * Receive Agent response
-         */
         if (receive_response(socket_fd,
                              response,
                              sizeof(response)) < 0)
@@ -223,13 +321,8 @@ int main(void)
 
         printf("Agent: %s", response);
 
-        /*
-         * QUIT closes the session.
-         */
         if (strcmp(command, "QUIT") == 0)
-        {
             break;
-        }
     }
 
     close(socket_fd);
