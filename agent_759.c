@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #define PORT 9410
 #define BUFFER_SIZE 4096
@@ -14,6 +15,9 @@
 #define STORAGE_PATH "./agentfiles/IT24102759"
 #define MAX_FILE_SIZE (1024 * 1024)
 
+/*
+ * Send all bytes.
+ */
 int send_all(int socket_fd,
              const unsigned char *data,
              size_t length)
@@ -22,13 +26,16 @@ int send_all(int socket_fd,
 
     while (total_sent < length)
     {
-        ssize_t sent = send(socket_fd,
-                            data + total_sent,
-                            length - total_sent,
-                            0);
+        ssize_t sent =
+            send(socket_fd,
+                 data + total_sent,
+                 length - total_sent,
+                 0);
 
         if (sent <= 0)
+        {
             return -1;
+        }
 
         total_sent += sent;
     }
@@ -36,13 +43,20 @@ int send_all(int socket_fd,
     return 0;
 }
 
-int send_response(int client_socket, const char *response)
+/*
+ * Send a text response.
+ */
+int send_response(int client_socket,
+                  const char *response)
 {
     return send_all(client_socket,
                     (const unsigned char *)response,
                     strlen(response));
 }
 
+/*
+ * Get system information.
+ */
 void get_system_info(double *cpu_load,
                      unsigned long *memory_used_mb,
                      unsigned long *uptime_sec)
@@ -53,6 +67,9 @@ void get_system_info(double *cpu_load,
     *memory_used_mb = 0;
     *uptime_sec = 0;
 
+    /*
+     * CPU load.
+     */
     file = fopen("/proc/loadavg", "r");
 
     if (file != NULL)
@@ -61,6 +78,9 @@ void get_system_info(double *cpu_load,
         fclose(file);
     }
 
+    /*
+     * Memory.
+     */
     unsigned long mem_total_kb = 0;
     unsigned long mem_available_kb = 0;
 
@@ -90,6 +110,9 @@ void get_system_info(double *cpu_load,
             (mem_total_kb - mem_available_kb) / 1024;
     }
 
+    /*
+     * Uptime.
+     */
     double uptime_seconds = 0.0;
 
     file = fopen("/proc/uptime", "r");
@@ -103,6 +126,9 @@ void get_system_info(double *cpu_load,
     *uptime_sec = (unsigned long)uptime_seconds;
 }
 
+/*
+ * Get process list.
+ */
 int get_process_list(char *process_list,
                      size_t buffer_size)
 {
@@ -110,7 +136,9 @@ int get_process_list(char *process_list,
         popen("ps -eo pid=,comm= --no-headers", "r");
 
     if (process_pipe == NULL)
+    {
         return -1;
+    }
 
     process_list[0] = '\0';
 
@@ -141,7 +169,9 @@ int get_process_list(char *process_list,
         size_t entry_length = strlen(entry);
 
         if (used + entry_length + 2 >= buffer_size)
+        {
             break;
+        }
 
         if (used > 0)
         {
@@ -159,6 +189,16 @@ int get_process_list(char *process_list,
     return 0;
 }
 
+/*
+ * Execute only the allowed commands.
+ *
+ * Allowed:
+ * DATE
+ * UPTIME
+ * DISKFREE
+ * HOSTNAME
+ * WHOAMI
+ */
 int execute_allowed_command(const char *command,
                             char *output,
                             size_t output_size)
@@ -166,22 +206,37 @@ int execute_allowed_command(const char *command,
     const char *shell_command = NULL;
 
     if (strcmp(command, "DATE") == 0)
+    {
         shell_command = "date";
+    }
     else if (strcmp(command, "UPTIME") == 0)
+    {
         shell_command = "uptime";
+    }
     else if (strcmp(command, "DISKFREE") == 0)
+    {
         shell_command = "df -h / | tail -1";
+    }
     else if (strcmp(command, "HOSTNAME") == 0)
+    {
         shell_command = "hostname";
+    }
     else if (strcmp(command, "WHOAMI") == 0)
+    {
         shell_command = "whoami";
+    }
     else
+    {
         return -1;
+    }
 
-    FILE *command_pipe = popen(shell_command, "r");
+    FILE *command_pipe =
+        popen(shell_command, "r");
 
     if (command_pipe == NULL)
+    {
         return -2;
+    }
 
     output[0] = '\0';
 
@@ -200,28 +255,46 @@ int execute_allowed_command(const char *command,
     return 0;
 }
 
+/*
+ * Validate filename.
+ */
 int valid_filename(const char *filename)
 {
-    if (filename == NULL || strlen(filename) == 0)
+    if (filename == NULL ||
+        strlen(filename) == 0)
+    {
         return 0;
+    }
 
     if (strlen(filename) > 255)
+    {
         return 0;
+    }
 
     if (strstr(filename, "..") != NULL)
+    {
         return 0;
+    }
 
     if (strchr(filename, '/') != NULL)
+    {
         return 0;
+    }
 
     if (strchr(filename, '\\') != NULL)
+    {
         return 0;
+    }
 
     return 1;
 }
 
 /*
- * Receive exactly file_size bytes for PUT.
+ * Receive exactly file_size bytes.
+ *
+ * Some file bytes may already be in input_buffer
+ * because the PUT header and file data can arrive
+ * in the same TCP packet.
  */
 int receive_file(int client_socket,
                  unsigned char *input_buffer,
@@ -233,13 +306,20 @@ int receive_file(int client_socket,
 
     while (received_total < file_size)
     {
+        /*
+         * Use bytes already buffered first.
+         */
         if (*input_length > 0)
         {
             size_t available = *input_length;
-            size_t needed = file_size - received_total;
+
+            size_t needed =
+                file_size - received_total;
 
             size_t to_write =
-                available < needed ? available : needed;
+                available < needed
+                    ? available
+                    : needed;
 
             if (fwrite(input_buffer,
                        1,
@@ -263,9 +343,13 @@ int receive_file(int client_socket,
             continue;
         }
 
+        /*
+         * Receive more file data.
+         */
         unsigned char recv_buffer[4096];
 
-        size_t needed = file_size - received_total;
+        size_t needed =
+            file_size - received_total;
 
         size_t recv_size =
             needed < sizeof(recv_buffer)
@@ -279,12 +363,15 @@ int receive_file(int client_socket,
                  0);
 
         if (bytes_received <= 0)
+        {
             return -1;
+        }
 
         if (fwrite(recv_buffer,
                    1,
                    bytes_received,
-                   file) != (size_t)bytes_received)
+                   file) !=
+            (size_t)bytes_received)
         {
             return -1;
         }
@@ -319,6 +406,7 @@ int process_put(int client_socket,
                  SID);
 
         send_response(client_socket, response);
+
         return 0;
     }
 
@@ -332,6 +420,7 @@ int process_put(int client_socket,
                  SID);
 
         send_response(client_socket, response);
+
         return 0;
     }
 
@@ -345,6 +434,7 @@ int process_put(int client_socket,
                  SID);
 
         send_response(client_socket, response);
+
         return 0;
     }
 
@@ -368,6 +458,7 @@ int process_put(int client_socket,
                  SID);
 
         send_response(client_socket, response);
+
         return 0;
     }
 
@@ -436,6 +527,7 @@ int process_get(int client_socket,
                  SID);
 
         send_response(client_socket, response);
+
         return 0;
     }
 
@@ -449,6 +541,7 @@ int process_get(int client_socket,
                  SID);
 
         send_response(client_socket, response);
+
         return 0;
     }
 
@@ -472,12 +565,10 @@ int process_get(int client_socket,
                  SID);
 
         send_response(client_socket, response);
+
         return 0;
     }
 
-    /*
-     * Determine exact file size.
-     */
     fseek(file, 0, SEEK_END);
 
     long file_size = ftell(file);
@@ -502,7 +593,7 @@ int process_get(int client_socket,
     }
 
     /*
-     * Send FILE_SEND header first.
+     * Send header.
      */
     char header[512];
 
@@ -524,7 +615,7 @@ int process_get(int client_socket,
            file_size);
 
     /*
-     * Send exactly file_size bytes.
+     * Send exact file bytes.
      */
     unsigned char buffer[4096];
 
@@ -532,7 +623,8 @@ int process_get(int client_socket,
 
     while (total_sent < file_size)
     {
-        long remaining = file_size - total_sent;
+        long remaining =
+            file_size - total_sent;
 
         size_t to_read =
             remaining < (long)sizeof(buffer)
@@ -570,6 +662,9 @@ int process_get(int client_socket,
     return 0;
 }
 
+/*
+ * Process a command.
+ */
 int process_command(int client_socket,
                     char *command,
                     int *authenticated,
@@ -578,13 +673,16 @@ int process_command(int client_socket,
 {
     size_t length = strlen(command);
 
-    if (length > 0 && command[length - 1] == '\r')
+    if (length > 0 &&
+        command[length - 1] == '\r')
+    {
         command[length - 1] = '\0';
+    }
 
     printf("Received: %s\n", command);
 
     /*
-     * Authentication
+     * AUTH must be first.
      */
     if (!(*authenticated))
     {
@@ -605,7 +703,8 @@ int process_command(int client_socket,
                          "OK AUTHENTICATED SID:%s\n",
                          SID);
 
-                send_response(client_socket, response);
+                send_response(client_socket,
+                              response);
             }
             else
             {
@@ -616,7 +715,8 @@ int process_command(int client_socket,
                          "ERR 001 AUTH_FAILED SID:%s\n",
                          SID);
 
-                send_response(client_socket, response);
+                send_response(client_socket,
+                              response);
             }
 
             return 0;
@@ -629,13 +729,14 @@ int process_command(int client_socket,
                  "ERR 002 AUTH_REQUIRED SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(client_socket,
+                      response);
 
         return 0;
     }
 
     /*
-     * QUIT
+     * QUIT.
      */
     if (strcmp(command, "QUIT") == 0)
     {
@@ -646,13 +747,16 @@ int process_command(int client_socket,
                  "OK BYE SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(client_socket,
+                      response);
+
+        printf("Controller requested disconnect.\n");
 
         return 1;
     }
 
     /*
-     * SYSINFO
+     * SYSINFO.
      */
     if (strcmp(command, "SYSINFO") == 0)
     {
@@ -674,13 +778,14 @@ int process_command(int client_socket,
                  uptime_sec,
                  SID);
 
-        send_response(client_socket, response);
+        send_response(client_socket,
+                      response);
 
         return 0;
     }
 
     /*
-     * LISTPROC
+     * LISTPROC.
      */
     if (strcmp(command, "LISTPROC") == 0)
     {
@@ -696,7 +801,8 @@ int process_command(int client_socket,
                      "ERR 003 PROCESS_LIST_FAILED SID:%s\n",
                      SID);
 
-            send_response(client_socket, response);
+            send_response(client_socket,
+                          response);
 
             return 0;
         }
@@ -709,13 +815,14 @@ int process_command(int client_socket,
                  process_list,
                  SID);
 
-        send_response(client_socket, response);
+        send_response(client_socket,
+                      response);
 
         return 0;
     }
 
     /*
-     * EXEC
+     * EXEC.
      */
     if (strncmp(command, "EXEC ", 5) == 0)
     {
@@ -737,7 +844,8 @@ int process_command(int client_socket,
                      "ERR 002 COMMAND_NOT_ALLOWED SID:%s\n",
                      SID);
 
-            send_response(client_socket, response);
+            send_response(client_socket,
+                          response);
 
             return 0;
         }
@@ -751,7 +859,8 @@ int process_command(int client_socket,
                      "ERR 006 EXEC_FAILED SID:%s\n",
                      SID);
 
-            send_response(client_socket, response);
+            send_response(client_socket,
+                          response);
 
             return 0;
         }
@@ -764,13 +873,14 @@ int process_command(int client_socket,
                  output,
                  SID);
 
-        send_response(client_socket, response);
+        send_response(client_socket,
+                      response);
 
         return 0;
     }
 
     /*
-     * PUT
+     * PUT.
      */
     if (strncmp(command, "PUT ", 4) == 0)
     {
@@ -781,7 +891,7 @@ int process_command(int client_socket,
     }
 
     /*
-     * GET
+     * GET.
      */
     if (strncmp(command, "GET ", 4) == 0)
     {
@@ -802,13 +912,14 @@ int process_command(int client_socket,
                  "ERR 004 NOT_IMPLEMENTED SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(client_socket,
+                      response);
 
         return 0;
     }
 
     /*
-     * Unknown command
+     * Unknown command.
      */
     {
         char response[128];
@@ -818,28 +929,169 @@ int process_command(int client_socket,
                  "ERR 003 UNKNOWN_COMMAND SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(client_socket,
+                      response);
     }
 
     return 0;
 }
 
+/*
+ * Thread function for each Controller.
+ */
+void *client_session(void *argument)
+{
+    int client_socket =
+        *((int *)argument);
+
+    free(argument);
+
+    printf("Controller thread started.\n");
+
+    int authenticated = 0;
+    int connection_open = 1;
+
+    unsigned char input_buffer[BUFFER_SIZE];
+
+    size_t input_length = 0;
+
+    while (connection_open)
+    {
+        unsigned char recv_buffer[1024];
+
+        ssize_t bytes_received =
+            recv(client_socket,
+                 recv_buffer,
+                 sizeof(recv_buffer),
+                 0);
+
+        if (bytes_received < 0)
+        {
+            perror("recv");
+            break;
+        }
+
+        if (bytes_received == 0)
+        {
+            printf("Controller disconnected.\n");
+            break;
+        }
+
+        /*
+         * Check buffer capacity.
+         */
+        if (input_length + bytes_received >= BUFFER_SIZE)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 005 INPUT_TOO_LARGE SID:%s\n",
+                     SID);
+
+            send_response(client_socket,
+                          response);
+
+            input_length = 0;
+
+            continue;
+        }
+
+        /*
+         * Add received bytes to buffer.
+         */
+        memcpy(input_buffer + input_length,
+               recv_buffer,
+               bytes_received);
+
+        input_length += bytes_received;
+
+        /*
+         * Process complete lines.
+         */
+        while (connection_open)
+        {
+            unsigned char *newline =
+                memchr(input_buffer,
+                       '\n',
+                       input_length);
+
+            if (newline == NULL)
+            {
+                break;
+            }
+
+            size_t command_length =
+                newline - input_buffer;
+
+            char command[BUFFER_SIZE];
+
+            memcpy(command,
+                   input_buffer,
+                   command_length);
+
+            command[command_length] = '\0';
+
+            /*
+             * Remove processed command.
+             */
+            size_t remaining =
+                input_length -
+                (command_length + 1);
+
+            memmove(input_buffer,
+                    newline + 1,
+                    remaining);
+
+            input_length = remaining;
+
+            /*
+             * Process command.
+             */
+            int result =
+                process_command(client_socket,
+                                command,
+                                &authenticated,
+                                input_buffer,
+                                &input_length);
+
+            if (result == 1)
+            {
+                connection_open = 0;
+                break;
+            }
+        }
+    }
+
+    close(client_socket);
+
+    printf("Controller thread finished.\n");
+
+    return NULL;
+}
+
+/*
+ * Main Agent.
+ */
 int main(void)
 {
     int server_socket;
-    int client_socket;
 
     struct sockaddr_in server_address;
-    struct sockaddr_in client_address;
 
-    socklen_t client_length =
-        sizeof(client_address);
-
+    /*
+     * Create storage directories.
+     */
     mkdir("agentfiles", 0755);
     mkdir(STORAGE_PATH, 0755);
 
+    /*
+     * Create TCP socket.
+     */
     server_socket =
-        socket(AF_INET, SOCK_STREAM, 0);
+        socket(AF_INET,
+               SOCK_STREAM,
+               0);
 
     if (server_socket < 0)
     {
@@ -847,14 +1099,25 @@ int main(void)
         return 1;
     }
 
+    /*
+     * Allow address reuse.
+     */
     int option = 1;
 
-    setsockopt(server_socket,
-               SOL_SOCKET,
-               SO_REUSEADDR,
-               &option,
-               sizeof(option));
+    if (setsockopt(server_socket,
+                   SOL_SOCKET,
+                   SO_REUSEADDR,
+                   &option,
+                   sizeof(option)) < 0)
+    {
+        perror("setsockopt");
+        close(server_socket);
+        return 1;
+    }
 
+    /*
+     * Configure server address.
+     */
     memset(&server_address,
            0,
            sizeof(server_address));
@@ -863,6 +1126,9 @@ int main(void)
     server_address.sin_addr.s_addr = INADDR_ANY;
     server_address.sin_port = htons(PORT);
 
+    /*
+     * Bind.
+     */
     if (bind(server_socket,
              (struct sockaddr *)&server_address,
              sizeof(server_address)) < 0)
@@ -872,7 +1138,10 @@ int main(void)
         return 1;
     }
 
-    if (listen(server_socket, 5) < 0)
+    /*
+     * Listen.
+     */
+    if (listen(server_socket, 10) < 0)
     {
         perror("listen");
         close(server_socket);
@@ -882,121 +1151,65 @@ int main(void)
     printf("RemoteOps Agent listening on TCP port %d...\n",
            PORT);
 
+    printf("Multi-client mode enabled.\n");
+
+    /*
+     * Accept Controllers continuously.
+     */
     while (1)
     {
-        printf("Waiting for Controller connection...\n");
+        struct sockaddr_in client_address;
 
-        client_socket =
+        socklen_t client_length =
+            sizeof(client_address);
+
+        int *client_socket =
+            malloc(sizeof(int));
+
+        if (client_socket == NULL)
+        {
+            perror("malloc");
+            continue;
+        }
+
+        *client_socket =
             accept(server_socket,
                    (struct sockaddr *)&client_address,
                    &client_length);
 
-        if (client_socket < 0)
+        if (*client_socket < 0)
         {
             perror("accept");
+            free(client_socket);
             continue;
         }
 
         printf("Controller connected.\n");
 
-        int authenticated = 0;
-        int connection_open = 1;
+        /*
+         * Create a thread for this Controller.
+         */
+        pthread_t thread_id;
 
-        unsigned char input_buffer[BUFFER_SIZE];
-        size_t input_length = 0;
-
-        while (connection_open)
+        if (pthread_create(&thread_id,
+                           NULL,
+                           client_session,
+                           client_socket) != 0)
         {
-            unsigned char recv_buffer[1024];
+            perror("pthread_create");
 
-            ssize_t bytes_received =
-                recv(client_socket,
-                     recv_buffer,
-                     sizeof(recv_buffer),
-                     0);
+            close(*client_socket);
+            free(client_socket);
 
-            if (bytes_received < 0)
-            {
-                perror("recv");
-                break;
-            }
-
-            if (bytes_received == 0)
-            {
-                printf("Controller disconnected.\n");
-                break;
-            }
-
-            if (input_length + bytes_received >= BUFFER_SIZE)
-            {
-                char response[128];
-
-                snprintf(response,
-                         sizeof(response),
-                         "ERR 005 INPUT_TOO_LARGE SID:%s\n",
-                         SID);
-
-                send_response(client_socket, response);
-
-                input_length = 0;
-                continue;
-            }
-
-            memcpy(input_buffer + input_length,
-                   recv_buffer,
-                   bytes_received);
-
-            input_length += bytes_received;
-
-            while (connection_open)
-            {
-                unsigned char *newline =
-                    memchr(input_buffer,
-                           '\n',
-                           input_length);
-
-                if (newline == NULL)
-                    break;
-
-                size_t command_length =
-                    newline - input_buffer;
-
-                char command[BUFFER_SIZE];
-
-                memcpy(command,
-                       input_buffer,
-                       command_length);
-
-                command[command_length] = '\0';
-
-                size_t remaining =
-                    input_length -
-                    (command_length + 1);
-
-                memmove(input_buffer,
-                        newline + 1,
-                        remaining);
-
-                input_length = remaining;
-
-                int result =
-                    process_command(client_socket,
-                                    command,
-                                    &authenticated,
-                                    input_buffer,
-                                    &input_length);
-
-                if (result == 1)
-                {
-                    connection_open = 0;
-                    break;
-                }
-            }
+            continue;
         }
 
-        close(client_socket);
+        /*
+         * Thread manages itself.
+         */
+        pthread_detach(thread_id);
 
-        printf("Controller session closed.\n");
+        printf("Client thread created.\n");
     }
 
     close(server_socket);
