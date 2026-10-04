@@ -14,30 +14,9 @@
 #define STORAGE_PATH "./agentfiles/IT24102759"
 #define MAX_FILE_SIZE (1024 * 1024)
 
-int send_response(int client_socket, const char *response)
-{
-    size_t total_sent = 0;
-    size_t length = strlen(response);
-
-    while (total_sent < length)
-    {
-        ssize_t sent = send(client_socket,
-                            response + total_sent,
-                            length - total_sent,
-                            0);
-
-        if (sent <= 0)
-            return -1;
-
-        total_sent += sent;
-    }
-
-    return 0;
-}
-
-int send_all_bytes(int socket_fd,
-                   const unsigned char *data,
-                   size_t length)
+int send_all(int socket_fd,
+             const unsigned char *data,
+             size_t length)
 {
     size_t total_sent = 0;
 
@@ -55,6 +34,13 @@ int send_all_bytes(int socket_fd,
     }
 
     return 0;
+}
+
+int send_response(int client_socket, const char *response)
+{
+    return send_all(client_socket,
+                    (const unsigned char *)response,
+                    strlen(response));
 }
 
 void get_system_info(double *cpu_load,
@@ -140,7 +126,9 @@ int get_process_list(char *process_list,
                    "%d %127s",
                    &pid,
                    process_name) != 2)
+        {
             continue;
+        }
 
         char entry[160];
 
@@ -162,6 +150,7 @@ int get_process_list(char *process_list,
         }
 
         strcat(process_list, entry);
+
         used += entry_length;
     }
 
@@ -196,7 +185,9 @@ int execute_allowed_command(const char *command,
 
     output[0] = '\0';
 
-    if (fgets(output, output_size, command_pipe) == NULL)
+    if (fgets(output,
+              output_size,
+              command_pipe) == NULL)
     {
         pclose(command_pipe);
         return -2;
@@ -230,11 +221,7 @@ int valid_filename(const char *filename)
 }
 
 /*
- * Receive exactly file_size bytes.
- *
- * Some bytes may already be present in input_buffer
- * because the PUT header and file data can arrive
- * in the same TCP recv().
+ * Receive exactly file_size bytes for PUT.
  */
 int receive_file(int client_socket,
                  unsigned char *input_buffer,
@@ -308,6 +295,9 @@ int receive_file(int client_socket,
     return 0;
 }
 
+/*
+ * Handle PUT.
+ */
 int process_put(int client_socket,
                 char *command,
                 unsigned char *input_buffer,
@@ -355,7 +345,6 @@ int process_put(int client_socket,
                  SID);
 
         send_response(client_socket, response);
-
         return 0;
     }
 
@@ -371,8 +360,6 @@ int process_put(int client_socket,
 
     if (file == NULL)
     {
-        perror("fopen");
-
         char response[128];
 
         snprintf(response,
@@ -381,7 +368,6 @@ int process_put(int client_socket,
                  SID);
 
         send_response(client_socket, response);
-
         return 0;
     }
 
@@ -430,6 +416,160 @@ int process_put(int client_socket,
     return 0;
 }
 
+/*
+ * Handle GET.
+ */
+int process_get(int client_socket,
+                char *command)
+{
+    char filename[256];
+
+    if (sscanf(command + 4,
+               "%255s",
+               filename) != 1)
+    {
+        char response[128];
+
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 005 FILE_NOT_FOUND SID:%s\n",
+                 SID);
+
+        send_response(client_socket, response);
+        return 0;
+    }
+
+    if (!valid_filename(filename))
+    {
+        char response[128];
+
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 005 FILE_NOT_FOUND SID:%s\n",
+                 SID);
+
+        send_response(client_socket, response);
+        return 0;
+    }
+
+    char path[512];
+
+    snprintf(path,
+             sizeof(path),
+             "%s/%s",
+             STORAGE_PATH,
+             filename);
+
+    FILE *file = fopen(path, "rb");
+
+    if (file == NULL)
+    {
+        char response[128];
+
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 005 FILE_NOT_FOUND SID:%s\n",
+                 SID);
+
+        send_response(client_socket, response);
+        return 0;
+    }
+
+    /*
+     * Determine exact file size.
+     */
+    fseek(file, 0, SEEK_END);
+
+    long file_size = ftell(file);
+
+    fseek(file, 0, SEEK_SET);
+
+    if (file_size < 0 ||
+        file_size > MAX_FILE_SIZE)
+    {
+        fclose(file);
+
+        char response[128];
+
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 005 FILE_NOT_FOUND SID:%s\n",
+                 SID);
+
+        send_response(client_socket, response);
+
+        return 0;
+    }
+
+    /*
+     * Send FILE_SEND header first.
+     */
+    char header[512];
+
+    snprintf(header,
+             sizeof(header),
+             "OK FILE_SEND %s %ld SID:%s\n",
+             filename,
+             file_size,
+             SID);
+
+    if (send_response(client_socket, header) < 0)
+    {
+        fclose(file);
+        return -1;
+    }
+
+    printf("Sending file: %s (%ld bytes)\n",
+           filename,
+           file_size);
+
+    /*
+     * Send exactly file_size bytes.
+     */
+    unsigned char buffer[4096];
+
+    long total_sent = 0;
+
+    while (total_sent < file_size)
+    {
+        long remaining = file_size - total_sent;
+
+        size_t to_read =
+            remaining < (long)sizeof(buffer)
+                ? (size_t)remaining
+                : sizeof(buffer);
+
+        size_t bytes_read =
+            fread(buffer,
+                  1,
+                  to_read,
+                  file);
+
+        if (bytes_read == 0)
+        {
+            fclose(file);
+            return -1;
+        }
+
+        if (send_all(client_socket,
+                     buffer,
+                     bytes_read) < 0)
+        {
+            fclose(file);
+            return -1;
+        }
+
+        total_sent += bytes_read;
+    }
+
+    fclose(file);
+
+    printf("File sent successfully: %s\n",
+           filename);
+
+    return 0;
+}
+
 int process_command(int client_socket,
                     char *command,
                     int *authenticated,
@@ -443,6 +583,9 @@ int process_command(int client_socket,
 
     printf("Received: %s\n", command);
 
+    /*
+     * Authentication
+     */
     if (!(*authenticated))
     {
         if (strncmp(command, "AUTH ", 5) == 0)
@@ -491,6 +634,9 @@ int process_command(int client_socket,
         return 0;
     }
 
+    /*
+     * QUIT
+     */
     if (strcmp(command, "QUIT") == 0)
     {
         char response[128];
@@ -505,6 +651,9 @@ int process_command(int client_socket,
         return 1;
     }
 
+    /*
+     * SYSINFO
+     */
     if (strcmp(command, "SYSINFO") == 0)
     {
         double cpu_load;
@@ -530,6 +679,9 @@ int process_command(int client_socket,
         return 0;
     }
 
+    /*
+     * LISTPROC
+     */
     if (strcmp(command, "LISTPROC") == 0)
     {
         char process_list[3000];
@@ -562,6 +714,9 @@ int process_command(int client_socket,
         return 0;
     }
 
+    /*
+     * EXEC
+     */
     if (strncmp(command, "EXEC ", 5) == 0)
     {
         char *command_name = command + 5;
@@ -614,6 +769,9 @@ int process_command(int client_socket,
         return 0;
     }
 
+    /*
+     * PUT
+     */
     if (strncmp(command, "PUT ", 4) == 0)
     {
         return process_put(client_socket,
@@ -622,8 +780,19 @@ int process_command(int client_socket,
                            input_length);
     }
 
-    if (strncmp(command, "GET ", 4) == 0 ||
-        strcmp(command, "MONITOR START") == 0 ||
+    /*
+     * GET
+     */
+    if (strncmp(command, "GET ", 4) == 0)
+    {
+        return process_get(client_socket,
+                           command);
+    }
+
+    /*
+     * MONITOR will be implemented later.
+     */
+    if (strcmp(command, "MONITOR START") == 0 ||
         strcmp(command, "MONITOR STOP") == 0)
     {
         char response[128];
@@ -638,14 +807,19 @@ int process_command(int client_socket,
         return 0;
     }
 
-    char response[128];
+    /*
+     * Unknown command
+     */
+    {
+        char response[128];
 
-    snprintf(response,
-             sizeof(response),
-             "ERR 003 UNKNOWN_COMMAND SID:%s\n",
-             SID);
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 003 UNKNOWN_COMMAND SID:%s\n",
+                 SID);
 
-    send_response(client_socket, response);
+        send_response(client_socket, response);
+    }
 
     return 0;
 }

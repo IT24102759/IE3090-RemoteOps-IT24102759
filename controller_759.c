@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 
 #define SERVER_PORT 9410
 #define SERVER_IP "127.0.0.1"
@@ -64,6 +63,32 @@ int receive_response(int socket_fd,
     return 0;
 }
 
+/*
+ * Receive exactly length bytes.
+ */
+int receive_exact(int socket_fd,
+                  unsigned char *buffer,
+                  size_t length)
+{
+    size_t total_received = 0;
+
+    while (total_received < length)
+    {
+        ssize_t received =
+            recv(socket_fd,
+                 buffer + total_received,
+                 length - total_received,
+                 0);
+
+        if (received <= 0)
+            return -1;
+
+        total_received += received;
+    }
+
+    return 0;
+}
+
 int upload_file(int socket_fd,
                 const char *filename)
 {
@@ -87,9 +112,6 @@ int upload_file(int socket_fd,
         return 0;
     }
 
-    /*
-     * Build PUT header.
-     */
     char header[512];
 
     snprintf(header,
@@ -102,9 +124,6 @@ int upload_file(int socket_fd,
            filename,
            file_size);
 
-    /*
-     * Send header.
-     */
     if (send_all(socket_fd,
                  (unsigned char *)header,
                  strlen(header)) < 0)
@@ -113,9 +132,6 @@ int upload_file(int socket_fd,
         return 0;
     }
 
-    /*
-     * Send exact file bytes.
-     */
     unsigned char buffer[4096];
 
     size_t total_sent = 0;
@@ -154,6 +170,141 @@ int upload_file(int socket_fd,
     }
 
     fclose(file);
+
+    return 1;
+}
+
+/*
+ * Download file using GET.
+ */
+int download_file(int socket_fd,
+                  const char *filename)
+{
+    char command[512];
+
+    snprintf(command,
+             sizeof(command),
+             "GET %s\n",
+             filename);
+
+    printf("Controller: GET %s\n",
+           filename);
+
+    if (send_all(socket_fd,
+                 (unsigned char *)command,
+                 strlen(command)) < 0)
+    {
+        return 0;
+    }
+
+    /*
+     * First receive the FILE_SEND header.
+     */
+    char response[BUFFER_SIZE];
+
+    if (receive_response(socket_fd,
+                         response,
+                         sizeof(response)) < 0)
+    {
+        printf("Agent disconnected.\n");
+        return 0;
+    }
+
+    printf("Agent: %s", response);
+
+    /*
+     * Check for error response.
+     */
+    if (strncmp(response,
+                "OK FILE_SEND ",
+                13) != 0)
+    {
+        return 0;
+    }
+
+    char received_filename[256];
+    unsigned long long file_size;
+    char received_sid[64];
+
+    if (sscanf(response,
+               "OK FILE_SEND %255s %llu SID:%63s",
+               received_filename,
+               &file_size,
+               received_sid) != 3)
+    {
+        printf("Invalid FILE_SEND response.\n");
+        return 0;
+    }
+
+    /*
+     * Save downloaded file with a prefix
+     * so the original test file is preserved.
+     */
+    char output_filename[512];
+
+    snprintf(output_filename,
+             sizeof(output_filename),
+             "downloaded_%s",
+             received_filename);
+
+    FILE *file = fopen(output_filename, "wb");
+
+    if (file == NULL)
+    {
+        perror("fopen");
+        return 0;
+    }
+
+    /*
+     * Receive exactly file_size bytes.
+     */
+    unsigned char buffer[4096];
+
+    unsigned long long total_received = 0;
+
+    while (total_received < file_size)
+    {
+        unsigned long long remaining =
+            file_size - total_received;
+
+        size_t to_receive =
+            remaining < sizeof(buffer)
+                ? (size_t)remaining
+                : sizeof(buffer);
+
+        ssize_t bytes_received =
+            recv(socket_fd,
+                 buffer,
+                 to_receive,
+                 0);
+
+        if (bytes_received <= 0)
+        {
+            fclose(file);
+            remove(output_filename);
+
+            return 0;
+        }
+
+        if (fwrite(buffer,
+                   1,
+                   bytes_received,
+                   file) != (size_t)bytes_received)
+        {
+            fclose(file);
+            remove(output_filename);
+
+            return 0;
+        }
+
+        total_received += bytes_received;
+    }
+
+    fclose(file);
+
+    printf("Downloaded %s (%llu bytes)\n",
+           output_filename,
+           file_size);
 
     return 1;
 }
@@ -203,7 +354,7 @@ int main(void)
     printf("Connected to RemoteOps Agent.\n");
 
     /*
-     * Authenticate.
+     * Authentication.
      */
     char auth_command[128];
 
@@ -233,7 +384,7 @@ int main(void)
     printf("Agent: %s", response);
 
     /*
-     * Interactive commands.
+     * Interactive command loop.
      */
     char command[BUFFER_SIZE];
 
@@ -255,8 +406,7 @@ int main(void)
             continue;
 
         /*
-         * PUT is handled separately because
-         * raw file bytes follow the header.
+         * PUT
          */
         if (strncmp(command, "PUT ", 4) == 0)
         {
@@ -291,7 +441,31 @@ int main(void)
         }
 
         /*
-         * Normal text command.
+         * GET
+         */
+        if (strncmp(command, "GET ", 4) == 0)
+        {
+            char filename[256];
+
+            if (sscanf(command + 4,
+                       "%255s",
+                       filename) != 1)
+            {
+                printf("Usage: GET <filename>\n");
+                continue;
+            }
+
+            if (!download_file(socket_fd,
+                               filename))
+            {
+                printf("File download failed.\n");
+            }
+
+            continue;
+        }
+
+        /*
+         * Normal command.
          */
         char command_to_send[BUFFER_SIZE + 2];
 
