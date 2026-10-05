@@ -6,16 +6,20 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <time.h>
 
 #define PORT 9410
 #define BUFFER_SIZE 4096
 #define AUTH_TOKEN "OPS-2759"
 #define SID "9572"
+#define LOG_FILE "remoteops_IT24102759.log"
 
 #define STORAGE_PATH "./agentfiles/IT24102759"
 #define MAX_FILE_SIZE (1024 * 1024)
 
 #define MONITOR_INTERVAL_SEC 2
+
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct
 {
@@ -34,6 +38,45 @@ typedef struct
     pthread_mutex_t monitor_mutex;
 
 } ClientSession;
+
+/*
+ * Thread-safe timestamped logging.
+ */
+void log_event(const char *event)
+{
+    time_t current_time;
+    struct tm time_info;
+    char timestamp[64];
+
+    time(&current_time);
+
+    if (localtime_r(&current_time, &time_info) == NULL)
+    {
+        return;
+    }
+
+    strftime(timestamp,
+             sizeof(timestamp),
+             "%Y-%m-%d %H:%M:%S",
+             &time_info);
+
+    pthread_mutex_lock(&log_mutex);
+
+    FILE *log_file = fopen(LOG_FILE, "a");
+
+    if (log_file != NULL)
+    {
+        fprintf(log_file,
+                "[%s] SID:%s %s\n",
+                timestamp,
+                SID,
+                event);
+
+        fclose(log_file);
+    }
+
+    pthread_mutex_unlock(&log_mutex);
+}
 
 /*
  * Send all bytes.
@@ -502,6 +545,14 @@ int process_put(ClientSession *session,
     printf("File received successfully: %s\n",
            filename);
 
+    char log_message[512];
+    snprintf(log_message,
+             sizeof(log_message),
+             "PUT completed: %s (%llu bytes)",
+             filename,
+             file_size);
+    log_event(log_message);
+
     char response[512];
 
     snprintf(response,
@@ -667,6 +718,14 @@ int process_get(ClientSession *session,
     printf("File sent successfully: %s\n",
            filename);
 
+    char log_message[512];
+    snprintf(log_message,
+             sizeof(log_message),
+             "GET completed: %s (%ld bytes)",
+             filename,
+             file_size);
+    log_event(log_message);
+
     return 0;
 }
 
@@ -710,6 +769,13 @@ void *monitor_thread_function(void *argument)
 
     printf("UDP monitoring started on port %d.\n",
            session->monitor_udp_port);
+
+    char log_message[256];
+    snprintf(log_message,
+             sizeof(log_message),
+             "UDP monitoring started on port %d",
+             session->monitor_udp_port);
+    log_event(log_message);
 
     while (1)
     {
@@ -756,6 +822,8 @@ void *monitor_thread_function(void *argument)
     close(udp_socket);
 
     printf("UDP monitoring stopped.\n");
+
+    log_event("UDP monitoring thread stopped");
 
     return NULL;
 }
@@ -837,6 +905,24 @@ int process_command(ClientSession *session,
 
     printf("Received: %s\n", command);
 
+    char log_message[512];
+
+    if (strncmp(command, "AUTH ", 5) == 0)
+    {
+        snprintf(log_message,
+                 sizeof(log_message),
+                 "Command: AUTH");
+    }
+    else
+    {
+        snprintf(log_message,
+                 sizeof(log_message),
+                 "Command: %s",
+                 command);
+    }
+
+    log_event(log_message);
+
     /*
      * Authentication.
      */
@@ -851,6 +937,7 @@ int process_command(ClientSession *session,
                 session->authenticated = 1;
 
                 printf("Authentication successful.\n");
+                log_event("AUTH successful");
 
                 char response[128];
 
@@ -870,6 +957,8 @@ int process_command(ClientSession *session,
                          sizeof(response),
                          "ERR 001 AUTH_FAILED SID:%s\n",
                          SID);
+
+                log_event("AUTH failed");
 
                 send_response(session->client_socket,
                               response);
@@ -922,6 +1011,7 @@ int process_command(ClientSession *session,
                       response);
 
         printf("Controller requested disconnect.\n");
+        log_event("Controller requested QUIT");
 
         return 1;
     }
@@ -1224,6 +1314,7 @@ void *client_session(void *argument)
         if (bytes_received == 0)
         {
             printf("Controller disconnected.\n");
+            log_event("Controller disconnected");
             break;
         }
 
@@ -1321,6 +1412,7 @@ void *client_session(void *argument)
     pthread_mutex_destroy(&session->monitor_mutex);
 
     printf("Controller thread finished.\n");
+    log_event("Controller thread finished");
 
     free(session);
 
@@ -1435,6 +1527,7 @@ int main(void)
                            NULL);
 
         printf("Controller connected.\n");
+        log_event("Controller connected");
 
         pthread_t thread_id;
 
@@ -1464,3 +1557,4 @@ int main(void)
 
     return 0;
 }
+

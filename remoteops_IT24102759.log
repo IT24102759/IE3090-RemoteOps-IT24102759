@@ -1,0 +1,28 @@
+[2026-10-05 14:44:15] SID:9572 Controller connected
+[2026-10-05 14:44:15] SID:9572 Command: AUTH
+[2026-10-05 14:44:15] SID:9572 AUTH successful
+[2026-10-05 14:44:20] SID:9572 Command: AUTH
+[2026-10-05 14:44:28] SID:9572 Command: SYSINFO
+[2026-10-05 14:44:34] SID:9572 Command: LISTPROC
+[2026-10-05 14:44:40] SID:9572 Command: EXEC DATE
+[2026-10-05 14:44:47] SID:9572 Command: QUIT
+[2026-10-05 14:44:47] SID:9572 Controller requested QUIT
+[2026-10-05 14:44:47] SID:9572 Controller thread finished
+[2026-10-05 14:46:05] SID:9572 Controller connected
+[2026-10-05 14:46:05] SID:9572 Command: AUTH
+[2026-10-05 14:46:05] SID:9572 AUTH successful
+[2026-10-05 14:46:11] SID:9572 Command: SYSINFO
+[2026-10-05 14:46:16] SID:9572 Command: LISTPROC
+[2026-10-05 14:46:21] SID:9572 Command: EXEC DATE
+[2026-10-05 14:47:34] SID:9572 Command: PUT test_upload.txt 34
+[2026-10-05 14:47:34] SID:9572 PUT completed: test_upload.txt (34 bytes)
+[2026-10-05 14:47:40] SID:9572 Command: GET test_upload.txt
+[2026-10-05 14:47:40] SID:9572 GET completed: test_upload.txt (34 bytes)
+[2026-10-05 14:47:47] SID:9572 Command: MONITOR START 9759
+[2026-10-05 14:47:47] SID:9572 UDP monitoring started on port 9759
+[2026-10-05 14:47:55] SID:9572 Command: MONITOR STOP
+[2026-10-05 14:47:57] SID:9572 UDP monitoring thread stopped
+[2026-10-05 14:47:59] SID:9572 Command: MONITOR STOP
+[2026-10-05 14:48:13] SID:9572 Command: QUIT
+[2026-10-05 14:48:13] SID:9572 Controller requested QUIT
+[2026-10-05 14:48:13] SID:9572 Controller thread finished
