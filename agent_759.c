@@ -15,6 +15,26 @@
 #define STORAGE_PATH "./agentfiles/IT24102759"
 #define MAX_FILE_SIZE (1024 * 1024)
 
+#define MONITOR_INTERVAL_SEC 2
+
+typedef struct
+{
+    int client_socket;
+
+    struct sockaddr_in client_address;
+
+    int authenticated;
+    int connection_open;
+
+    pthread_t monitor_thread;
+
+    int monitor_active;
+    int monitor_udp_port;
+
+    pthread_mutex_t monitor_mutex;
+
+} ClientSession;
+
 /*
  * Send all bytes.
  */
@@ -44,7 +64,7 @@ int send_all(int socket_fd,
 }
 
 /*
- * Send a text response.
+ * Send text response.
  */
 int send_response(int client_socket,
                   const char *response)
@@ -190,14 +210,7 @@ int get_process_list(char *process_list,
 }
 
 /*
- * Execute only the allowed commands.
- *
- * Allowed:
- * DATE
- * UPTIME
- * DISKFREE
- * HOSTNAME
- * WHOAMI
+ * Execute only allowed commands.
  */
 int execute_allowed_command(const char *command,
                             char *output,
@@ -291,10 +304,6 @@ int valid_filename(const char *filename)
 
 /*
  * Receive exactly file_size bytes.
- *
- * Some file bytes may already be in input_buffer
- * because the PUT header and file data can arrive
- * in the same TCP packet.
  */
 int receive_file(int client_socket,
                  unsigned char *input_buffer,
@@ -306,9 +315,6 @@ int receive_file(int client_socket,
 
     while (received_total < file_size)
     {
-        /*
-         * Use bytes already buffered first.
-         */
         if (*input_length > 0)
         {
             size_t available = *input_length;
@@ -343,9 +349,6 @@ int receive_file(int client_socket,
             continue;
         }
 
-        /*
-         * Receive more file data.
-         */
         unsigned char recv_buffer[4096];
 
         size_t needed =
@@ -383,9 +386,9 @@ int receive_file(int client_socket,
 }
 
 /*
- * Handle PUT.
+ * PUT command.
  */
-int process_put(int client_socket,
+int process_put(ClientSession *session,
                 char *command,
                 unsigned char *input_buffer,
                 size_t *input_length)
@@ -405,7 +408,8 @@ int process_put(int client_socket,
                  "ERR 004 INVALID_PUT SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return 0;
     }
@@ -419,7 +423,8 @@ int process_put(int client_socket,
                  "ERR 004 INVALID_FILENAME SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return 0;
     }
@@ -433,7 +438,8 @@ int process_put(int client_socket,
                  "ERR 004 FILE_TOO_LARGE SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return 0;
     }
@@ -457,7 +463,8 @@ int process_put(int client_socket,
                  "ERR 004 FILE_SAVE_FAILED SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return 0;
     }
@@ -467,7 +474,7 @@ int process_put(int client_socket,
            file_size);
 
     int result =
-        receive_file(client_socket,
+        receive_file(session->client_socket,
                      input_buffer,
                      input_length,
                      file,
@@ -486,7 +493,8 @@ int process_put(int client_socket,
                  "ERR 004 FILE_RECEIVE_FAILED SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return -1;
     }
@@ -502,15 +510,16 @@ int process_put(int client_socket,
              filename,
              SID);
 
-    send_response(client_socket, response);
+    send_response(session->client_socket,
+                  response);
 
     return 0;
 }
 
 /*
- * Handle GET.
+ * GET command.
  */
-int process_get(int client_socket,
+int process_get(ClientSession *session,
                 char *command)
 {
     char filename[256];
@@ -526,7 +535,8 @@ int process_get(int client_socket,
                  "ERR 005 FILE_NOT_FOUND SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return 0;
     }
@@ -540,7 +550,8 @@ int process_get(int client_socket,
                  "ERR 005 FILE_NOT_FOUND SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return 0;
     }
@@ -564,7 +575,8 @@ int process_get(int client_socket,
                  "ERR 005 FILE_NOT_FOUND SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return 0;
     }
@@ -587,14 +599,12 @@ int process_get(int client_socket,
                  "ERR 005 FILE_NOT_FOUND SID:%s\n",
                  SID);
 
-        send_response(client_socket, response);
+        send_response(session->client_socket,
+                      response);
 
         return 0;
     }
 
-    /*
-     * Send header.
-     */
     char header[512];
 
     snprintf(header,
@@ -604,7 +614,8 @@ int process_get(int client_socket,
              file_size,
              SID);
 
-    if (send_response(client_socket, header) < 0)
+    if (send_response(session->client_socket,
+                      header) < 0)
     {
         fclose(file);
         return -1;
@@ -614,9 +625,6 @@ int process_get(int client_socket,
            filename,
            file_size);
 
-    /*
-     * Send exact file bytes.
-     */
     unsigned char buffer[4096];
 
     long total_sent = 0;
@@ -643,7 +651,7 @@ int process_get(int client_socket,
             return -1;
         }
 
-        if (send_all(client_socket,
+        if (send_all(session->client_socket,
                      buffer,
                      bytes_read) < 0)
         {
@@ -663,11 +671,159 @@ int process_get(int client_socket,
 }
 
 /*
- * Process a command.
+ * UDP monitoring thread.
  */
-int process_command(int client_socket,
+void *monitor_thread_function(void *argument)
+{
+    ClientSession *session =
+        (ClientSession *)argument;
+
+    int udp_socket =
+        socket(AF_INET,
+               SOCK_DGRAM,
+               0);
+
+    if (udp_socket < 0)
+    {
+        perror("monitor UDP socket");
+
+        pthread_mutex_lock(&session->monitor_mutex);
+        session->monitor_active = 0;
+        pthread_mutex_unlock(&session->monitor_mutex);
+
+        return NULL;
+    }
+
+    struct sockaddr_in destination;
+
+    memset(&destination,
+           0,
+           sizeof(destination));
+
+    destination.sin_family = AF_INET;
+
+    destination.sin_addr =
+        session->client_address.sin_addr;
+
+    destination.sin_port =
+        htons(session->monitor_udp_port);
+
+    printf("UDP monitoring started on port %d.\n",
+           session->monitor_udp_port);
+
+    while (1)
+    {
+        pthread_mutex_lock(&session->monitor_mutex);
+
+        int active =
+            session->monitor_active;
+
+        pthread_mutex_unlock(&session->monitor_mutex);
+
+        if (!active)
+        {
+            break;
+        }
+
+        double cpu_load;
+        unsigned long memory_used_mb;
+        unsigned long uptime_sec;
+
+        get_system_info(&cpu_load,
+                        &memory_used_mb,
+                        &uptime_sec);
+
+        char packet[512];
+
+        snprintf(packet,
+                 sizeof(packet),
+                 "SYSINFO %.2f %lu %lu SID:%s\n",
+                 cpu_load,
+                 memory_used_mb,
+                 uptime_sec,
+                 SID);
+
+        sendto(udp_socket,
+               packet,
+               strlen(packet),
+               0,
+               (struct sockaddr *)&destination,
+               sizeof(destination));
+
+        sleep(MONITOR_INTERVAL_SEC);
+    }
+
+    close(udp_socket);
+
+    printf("UDP monitoring stopped.\n");
+
+    return NULL;
+}
+
+/*
+ * Start UDP monitoring.
+ */
+int start_monitor(ClientSession *session,
+                  int udp_port)
+{
+    pthread_mutex_lock(&session->monitor_mutex);
+
+    if (session->monitor_active)
+    {
+        pthread_mutex_unlock(&session->monitor_mutex);
+
+        return -1;
+    }
+
+    session->monitor_udp_port = udp_port;
+    session->monitor_active = 1;
+
+    pthread_mutex_unlock(&session->monitor_mutex);
+
+    if (pthread_create(&session->monitor_thread,
+                       NULL,
+                       monitor_thread_function,
+                       session) != 0)
+    {
+        pthread_mutex_lock(&session->monitor_mutex);
+        session->monitor_active = 0;
+        pthread_mutex_unlock(&session->monitor_mutex);
+
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Stop UDP monitoring.
+ */
+int stop_monitor(ClientSession *session)
+{
+    pthread_mutex_lock(&session->monitor_mutex);
+
+    if (!session->monitor_active)
+    {
+        pthread_mutex_unlock(&session->monitor_mutex);
+
+        return -1;
+    }
+
+    session->monitor_active = 0;
+
+    pthread_mutex_unlock(&session->monitor_mutex);
+
+    pthread_join(session->monitor_thread,
+                 NULL);
+
+    return 0;
+}
+
+/*
+ * Process command.
+ */
+int process_command(ClientSession *session,
                     char *command,
-                    int *authenticated,
                     unsigned char *input_buffer,
                     size_t *input_length)
 {
@@ -682,9 +838,9 @@ int process_command(int client_socket,
     printf("Received: %s\n", command);
 
     /*
-     * AUTH must be first.
+     * Authentication.
      */
-    if (!(*authenticated))
+    if (!session->authenticated)
     {
         if (strncmp(command, "AUTH ", 5) == 0)
         {
@@ -692,7 +848,7 @@ int process_command(int client_socket,
 
             if (strcmp(token, AUTH_TOKEN) == 0)
             {
-                *authenticated = 1;
+                session->authenticated = 1;
 
                 printf("Authentication successful.\n");
 
@@ -703,7 +859,7 @@ int process_command(int client_socket,
                          "OK AUTHENTICATED SID:%s\n",
                          SID);
 
-                send_response(client_socket,
+                send_response(session->client_socket,
                               response);
             }
             else
@@ -715,7 +871,7 @@ int process_command(int client_socket,
                          "ERR 001 AUTH_FAILED SID:%s\n",
                          SID);
 
-                send_response(client_socket,
+                send_response(session->client_socket,
                               response);
             }
 
@@ -729,7 +885,7 @@ int process_command(int client_socket,
                  "ERR 002 AUTH_REQUIRED SID:%s\n",
                  SID);
 
-        send_response(client_socket,
+        send_response(session->client_socket,
                       response);
 
         return 0;
@@ -740,6 +896,21 @@ int process_command(int client_socket,
      */
     if (strcmp(command, "QUIT") == 0)
     {
+        /*
+         * Stop monitoring first.
+         */
+        pthread_mutex_lock(&session->monitor_mutex);
+
+        int monitor_active =
+            session->monitor_active;
+
+        pthread_mutex_unlock(&session->monitor_mutex);
+
+        if (monitor_active)
+        {
+            stop_monitor(session);
+        }
+
         char response[128];
 
         snprintf(response,
@@ -747,7 +918,7 @@ int process_command(int client_socket,
                  "OK BYE SID:%s\n",
                  SID);
 
-        send_response(client_socket,
+        send_response(session->client_socket,
                       response);
 
         printf("Controller requested disconnect.\n");
@@ -778,7 +949,7 @@ int process_command(int client_socket,
                  uptime_sec,
                  SID);
 
-        send_response(client_socket,
+        send_response(session->client_socket,
                       response);
 
         return 0;
@@ -801,7 +972,7 @@ int process_command(int client_socket,
                      "ERR 003 PROCESS_LIST_FAILED SID:%s\n",
                      SID);
 
-            send_response(client_socket,
+            send_response(session->client_socket,
                           response);
 
             return 0;
@@ -815,7 +986,7 @@ int process_command(int client_socket,
                  process_list,
                  SID);
 
-        send_response(client_socket,
+        send_response(session->client_socket,
                       response);
 
         return 0;
@@ -844,7 +1015,7 @@ int process_command(int client_socket,
                      "ERR 002 COMMAND_NOT_ALLOWED SID:%s\n",
                      SID);
 
-            send_response(client_socket,
+            send_response(session->client_socket,
                           response);
 
             return 0;
@@ -859,7 +1030,7 @@ int process_command(int client_socket,
                      "ERR 006 EXEC_FAILED SID:%s\n",
                      SID);
 
-            send_response(client_socket,
+            send_response(session->client_socket,
                           response);
 
             return 0;
@@ -873,7 +1044,7 @@ int process_command(int client_socket,
                  output,
                  SID);
 
-        send_response(client_socket,
+        send_response(session->client_socket,
                       response);
 
         return 0;
@@ -884,7 +1055,7 @@ int process_command(int client_socket,
      */
     if (strncmp(command, "PUT ", 4) == 0)
     {
-        return process_put(client_socket,
+        return process_put(session,
                            command,
                            input_buffer,
                            input_length);
@@ -895,24 +1066,108 @@ int process_command(int client_socket,
      */
     if (strncmp(command, "GET ", 4) == 0)
     {
-        return process_get(client_socket,
+        return process_get(session,
                            command);
     }
 
     /*
-     * MONITOR will be implemented later.
+     * MONITOR START.
      */
-    if (strcmp(command, "MONITOR START") == 0 ||
-        strcmp(command, "MONITOR STOP") == 0)
+    if (strncmp(command, "MONITOR START ", 14) == 0)
     {
+        int udp_port;
+
+        if (sscanf(command + 14,
+                   "%d",
+                   &udp_port) != 1)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 004 INVALID_MONITOR_PORT SID:%s\n",
+                     SID);
+
+            send_response(session->client_socket,
+                          response);
+
+            return 0;
+        }
+
+        if (udp_port < 1024 ||
+            udp_port > 65535)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 004 INVALID_MONITOR_PORT SID:%s\n",
+                     SID);
+
+            send_response(session->client_socket,
+                          response);
+
+            return 0;
+        }
+
+        if (start_monitor(session,
+                          udp_port) != 0)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 004 MONITOR_ALREADY_RUNNING SID:%s\n",
+                     SID);
+
+            send_response(session->client_socket,
+                          response);
+
+            return 0;
+        }
+
         char response[128];
 
         snprintf(response,
                  sizeof(response),
-                 "ERR 004 NOT_IMPLEMENTED SID:%s\n",
+                 "OK MONITOR_STARTED %d SID:%s\n",
+                 udp_port,
                  SID);
 
-        send_response(client_socket,
+        send_response(session->client_socket,
+                      response);
+
+        return 0;
+    }
+
+    /*
+     * MONITOR STOP.
+     */
+    if (strcmp(command, "MONITOR STOP") == 0)
+    {
+        if (stop_monitor(session) != 0)
+        {
+            char response[128];
+
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 004 MONITOR_NOT_RUNNING SID:%s\n",
+                     SID);
+
+            send_response(session->client_socket,
+                          response);
+
+            return 0;
+        }
+
+        char response[128];
+
+        snprintf(response,
+                 sizeof(response),
+                 "OK MONITOR_STOPPED SID:%s\n",
+                 SID);
+
+        send_response(session->client_socket,
                       response);
 
         return 0;
@@ -929,7 +1184,7 @@ int process_command(int client_socket,
                  "ERR 003 UNKNOWN_COMMAND SID:%s\n",
                  SID);
 
-        send_response(client_socket,
+        send_response(session->client_socket,
                       response);
     }
 
@@ -937,30 +1192,25 @@ int process_command(int client_socket,
 }
 
 /*
- * Thread function for each Controller.
+ * Controller session thread.
  */
 void *client_session(void *argument)
 {
-    int client_socket =
-        *((int *)argument);
-
-    free(argument);
+    ClientSession *session =
+        (ClientSession *)argument;
 
     printf("Controller thread started.\n");
-
-    int authenticated = 0;
-    int connection_open = 1;
 
     unsigned char input_buffer[BUFFER_SIZE];
 
     size_t input_length = 0;
 
-    while (connection_open)
+    while (session->connection_open)
     {
         unsigned char recv_buffer[1024];
 
         ssize_t bytes_received =
-            recv(client_socket,
+            recv(session->client_socket,
                  recv_buffer,
                  sizeof(recv_buffer),
                  0);
@@ -977,9 +1227,6 @@ void *client_session(void *argument)
             break;
         }
 
-        /*
-         * Check buffer capacity.
-         */
         if (input_length + bytes_received >= BUFFER_SIZE)
         {
             char response[128];
@@ -989,7 +1236,7 @@ void *client_session(void *argument)
                      "ERR 005 INPUT_TOO_LARGE SID:%s\n",
                      SID);
 
-            send_response(client_socket,
+            send_response(session->client_socket,
                           response);
 
             input_length = 0;
@@ -997,9 +1244,6 @@ void *client_session(void *argument)
             continue;
         }
 
-        /*
-         * Add received bytes to buffer.
-         */
         memcpy(input_buffer + input_length,
                recv_buffer,
                bytes_received);
@@ -1007,9 +1251,9 @@ void *client_session(void *argument)
         input_length += bytes_received;
 
         /*
-         * Process complete lines.
+         * Process every complete line.
          */
-        while (connection_open)
+        while (session->connection_open)
         {
             unsigned char *newline =
                 memchr(input_buffer,
@@ -1032,9 +1276,6 @@ void *client_session(void *argument)
 
             command[command_length] = '\0';
 
-            /*
-             * Remove processed command.
-             */
             size_t remaining =
                 input_length -
                 (command_length + 1);
@@ -1045,27 +1286,43 @@ void *client_session(void *argument)
 
             input_length = remaining;
 
-            /*
-             * Process command.
-             */
             int result =
-                process_command(client_socket,
+                process_command(session,
                                 command,
-                                &authenticated,
                                 input_buffer,
                                 &input_length);
 
             if (result == 1)
             {
-                connection_open = 0;
+                session->connection_open = 0;
                 break;
             }
         }
     }
 
-    close(client_socket);
+    /*
+     * Stop monitoring if Controller disconnects
+     * without sending QUIT.
+     */
+    pthread_mutex_lock(&session->monitor_mutex);
+
+    int monitor_active =
+        session->monitor_active;
+
+    pthread_mutex_unlock(&session->monitor_mutex);
+
+    if (monitor_active)
+    {
+        stop_monitor(session);
+    }
+
+    close(session->client_socket);
+
+    pthread_mutex_destroy(&session->monitor_mutex);
 
     printf("Controller thread finished.\n");
+
+    free(session);
 
     return NULL;
 }
@@ -1079,15 +1336,9 @@ int main(void)
 
     struct sockaddr_in server_address;
 
-    /*
-     * Create storage directories.
-     */
     mkdir("agentfiles", 0755);
     mkdir(STORAGE_PATH, 0755);
 
-    /*
-     * Create TCP socket.
-     */
     server_socket =
         socket(AF_INET,
                SOCK_STREAM,
@@ -1099,9 +1350,6 @@ int main(void)
         return 1;
     }
 
-    /*
-     * Allow address reuse.
-     */
     int option = 1;
 
     if (setsockopt(server_socket,
@@ -1115,9 +1363,6 @@ int main(void)
         return 1;
     }
 
-    /*
-     * Configure server address.
-     */
     memset(&server_address,
            0,
            sizeof(server_address));
@@ -1126,9 +1371,6 @@ int main(void)
     server_address.sin_addr.s_addr = INADDR_ANY;
     server_address.sin_port = htons(PORT);
 
-    /*
-     * Bind.
-     */
     if (bind(server_socket,
              (struct sockaddr *)&server_address,
              sizeof(server_address)) < 0)
@@ -1138,9 +1380,6 @@ int main(void)
         return 1;
     }
 
-    /*
-     * Listen.
-     */
     if (listen(server_socket, 10) < 0)
     {
         perror("listen");
@@ -1153,9 +1392,6 @@ int main(void)
 
     printf("Multi-client mode enabled.\n");
 
-    /*
-     * Accept Controllers continuously.
-     */
     while (1)
     {
         struct sockaddr_in client_address;
@@ -1163,50 +1399,62 @@ int main(void)
         socklen_t client_length =
             sizeof(client_address);
 
-        int *client_socket =
-            malloc(sizeof(int));
+        ClientSession *session =
+            malloc(sizeof(ClientSession));
 
-        if (client_socket == NULL)
+        if (session == NULL)
         {
             perror("malloc");
             continue;
         }
 
-        *client_socket =
+        memset(session,
+               0,
+               sizeof(ClientSession));
+
+        session->client_socket =
             accept(server_socket,
                    (struct sockaddr *)&client_address,
                    &client_length);
 
-        if (*client_socket < 0)
+        if (session->client_socket < 0)
         {
             perror("accept");
-            free(client_socket);
+            free(session);
             continue;
         }
 
+        session->client_address =
+            client_address;
+
+        session->authenticated = 0;
+        session->connection_open = 1;
+        session->monitor_active = 0;
+
+        pthread_mutex_init(&session->monitor_mutex,
+                           NULL);
+
         printf("Controller connected.\n");
 
-        /*
-         * Create a thread for this Controller.
-         */
         pthread_t thread_id;
 
         if (pthread_create(&thread_id,
                            NULL,
                            client_session,
-                           client_socket) != 0)
+                           session) != 0)
         {
             perror("pthread_create");
 
-            close(*client_socket);
-            free(client_socket);
+            close(session->client_socket);
+
+            pthread_mutex_destroy(
+                &session->monitor_mutex);
+
+            free(session);
 
             continue;
         }
 
-        /*
-         * Thread manages itself.
-         */
         pthread_detach(thread_id);
 
         printf("Client thread created.\n");

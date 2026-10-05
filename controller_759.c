@@ -4,12 +4,28 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <pthread.h>
 
 #define SERVER_PORT 9410
 #define SERVER_IP "127.0.0.1"
 #define BUFFER_SIZE 4096
 #define AUTH_TOKEN "OPS-2759"
 
+/*
+ * UDP monitoring receiver information.
+ */
+typedef struct
+{
+    int udp_socket;
+    int running;
+    pthread_t thread;
+
+} MonitorReceiver;
+
+
+/*
+ * Send all bytes.
+ */
 int send_all(int socket_fd,
              const unsigned char *data,
              size_t length)
@@ -25,7 +41,9 @@ int send_all(int socket_fd,
                  0);
 
         if (sent <= 0)
+        {
             return -1;
+        }
 
         total_sent += sent;
     }
@@ -33,6 +51,10 @@ int send_all(int socket_fd,
     return 0;
 }
 
+
+/*
+ * Receive one complete newline-terminated response.
+ */
 int receive_response(int socket_fd,
                      char *buffer,
                      size_t buffer_size)
@@ -50,12 +72,16 @@ int receive_response(int socket_fd,
                  0);
 
         if (bytes <= 0)
+        {
             return -1;
+        }
 
         buffer[received++] = character;
 
         if (character == '\n')
+        {
             break;
+        }
     }
 
     buffer[received] = '\0';
@@ -63,36 +89,15 @@ int receive_response(int socket_fd,
     return 0;
 }
 
+
 /*
- * Receive exactly length bytes.
+ * Upload a file using PUT.
  */
-int receive_exact(int socket_fd,
-                  unsigned char *buffer,
-                  size_t length)
-{
-    size_t total_received = 0;
-
-    while (total_received < length)
-    {
-        ssize_t received =
-            recv(socket_fd,
-                 buffer + total_received,
-                 length - total_received,
-                 0);
-
-        if (received <= 0)
-            return -1;
-
-        total_received += received;
-    }
-
-    return 0;
-}
-
 int upload_file(int socket_fd,
                 const char *filename)
 {
-    FILE *file = fopen(filename, "rb");
+    FILE *file =
+        fopen(filename, "rb");
 
     if (file == NULL)
     {
@@ -102,7 +107,8 @@ int upload_file(int socket_fd,
 
     fseek(file, 0, SEEK_END);
 
-    long file_size = ftell(file);
+    long file_size =
+        ftell(file);
 
     fseek(file, 0, SEEK_SET);
 
@@ -174,8 +180,9 @@ int upload_file(int socket_fd,
     return 1;
 }
 
+
 /*
- * Download file using GET.
+ * Download a file using GET.
  */
 int download_file(int socket_fd,
                   const char *filename)
@@ -197,9 +204,6 @@ int download_file(int socket_fd,
         return 0;
     }
 
-    /*
-     * First receive the FILE_SEND header.
-     */
     char response[BUFFER_SIZE];
 
     if (receive_response(socket_fd,
@@ -210,11 +214,9 @@ int download_file(int socket_fd,
         return 0;
     }
 
-    printf("Agent: %s", response);
+    printf("Agent: %s",
+           response);
 
-    /*
-     * Check for error response.
-     */
     if (strncmp(response,
                 "OK FILE_SEND ",
                 13) != 0)
@@ -223,7 +225,9 @@ int download_file(int socket_fd,
     }
 
     char received_filename[256];
+
     unsigned long long file_size;
+
     char received_sid[64];
 
     if (sscanf(response,
@@ -236,10 +240,6 @@ int download_file(int socket_fd,
         return 0;
     }
 
-    /*
-     * Save downloaded file with a prefix
-     * so the original test file is preserved.
-     */
     char output_filename[512];
 
     snprintf(output_filename,
@@ -247,7 +247,8 @@ int download_file(int socket_fd,
              "downloaded_%s",
              received_filename);
 
-    FILE *file = fopen(output_filename, "wb");
+    FILE *file =
+        fopen(output_filename, "wb");
 
     if (file == NULL)
     {
@@ -255,9 +256,6 @@ int download_file(int socket_fd,
         return 0;
     }
 
-    /*
-     * Receive exactly file_size bytes.
-     */
     unsigned char buffer[4096];
 
     unsigned long long total_received = 0;
@@ -289,7 +287,8 @@ int download_file(int socket_fd,
         if (fwrite(buffer,
                    1,
                    bytes_received,
-                   file) != (size_t)bytes_received)
+                   file) !=
+            (size_t)bytes_received)
         {
             fclose(file);
             remove(output_filename);
@@ -309,12 +308,168 @@ int download_file(int socket_fd,
     return 1;
 }
 
+
+/*
+ * UDP monitoring receiver thread.
+ */
+void *monitor_receiver(void *argument)
+{
+    MonitorReceiver *monitor =
+        (MonitorReceiver *)argument;
+
+    char buffer[1024];
+
+    struct sockaddr_in sender_address;
+
+    socklen_t sender_length =
+        sizeof(sender_address);
+
+    printf("UDP monitoring receiver started.\n");
+
+    while (monitor->running)
+    {
+        ssize_t bytes_received =
+            recvfrom(monitor->udp_socket,
+                     buffer,
+                     sizeof(buffer) - 1,
+                     0,
+                     (struct sockaddr *)&sender_address,
+                     &sender_length);
+
+        if (bytes_received < 0)
+        {
+            if (monitor->running)
+            {
+                perror("recvfrom");
+            }
+
+            break;
+        }
+
+        buffer[bytes_received] = '\0';
+
+        if (monitor->running)
+        {
+            printf("\n[UDP MONITOR] %s",
+                   buffer);
+
+            printf("RemoteOps> ");
+            fflush(stdout);
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Start UDP receiver.
+ */
+int start_udp_monitor(MonitorReceiver *monitor,
+                       int udp_port)
+{
+    monitor->udp_socket =
+        socket(AF_INET,
+               SOCK_DGRAM,
+               0);
+
+    if (monitor->udp_socket < 0)
+    {
+        perror("UDP socket");
+        return -1;
+    }
+
+    struct sockaddr_in local_address;
+
+    memset(&local_address,
+           0,
+           sizeof(local_address));
+
+    local_address.sin_family =
+        AF_INET;
+
+    local_address.sin_addr.s_addr =
+        htonl(INADDR_ANY);
+
+    local_address.sin_port =
+        htons(udp_port);
+
+    if (bind(monitor->udp_socket,
+             (struct sockaddr *)&local_address,
+             sizeof(local_address)) < 0)
+    {
+        perror("UDP bind");
+
+        close(monitor->udp_socket);
+
+        return -1;
+    }
+
+    monitor->running = 1;
+
+    if (pthread_create(&monitor->thread,
+                       NULL,
+                       monitor_receiver,
+                       monitor) != 0)
+    {
+        perror("pthread_create");
+
+        monitor->running = 0;
+
+        close(monitor->udp_socket);
+
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/*
+ * Stop UDP receiver.
+ */
+void stop_udp_monitor(MonitorReceiver *monitor)
+{
+    if (!monitor->running)
+    {
+        return;
+    }
+
+    monitor->running = 0;
+
+    /*
+     * Shutdown and close the UDP socket.
+     */
+    shutdown(monitor->udp_socket,
+             SHUT_RDWR);
+
+    close(monitor->udp_socket);
+
+    pthread_join(monitor->thread,
+                 NULL);
+
+    printf("UDP monitoring receiver stopped.\n");
+}
+
+
+/*
+ * Main Controller.
+ */
 int main(void)
 {
     int socket_fd;
 
     struct sockaddr_in server_address;
 
+    MonitorReceiver monitor;
+
+    memset(&monitor,
+           0,
+           sizeof(monitor));
+
+    /*
+     * Create TCP socket.
+     */
     socket_fd =
         socket(AF_INET,
                SOCK_STREAM,
@@ -326,28 +481,41 @@ int main(void)
         return 1;
     }
 
+    /*
+     * Configure Agent address.
+     */
     memset(&server_address,
            0,
            sizeof(server_address));
 
-    server_address.sin_family = AF_INET;
-    server_address.sin_port = htons(SERVER_PORT);
+    server_address.sin_family =
+        AF_INET;
+
+    server_address.sin_port =
+        htons(SERVER_PORT);
 
     if (inet_pton(AF_INET,
                   SERVER_IP,
                   &server_address.sin_addr) <= 0)
     {
         perror("inet_pton");
+
         close(socket_fd);
+
         return 1;
     }
 
+    /*
+     * Connect to Agent.
+     */
     if (connect(socket_fd,
                 (struct sockaddr *)&server_address,
                 sizeof(server_address)) < 0)
     {
         perror("connect");
+
         close(socket_fd);
+
         return 1;
     }
 
@@ -366,9 +534,13 @@ int main(void)
     printf("Controller: AUTH %s\n",
            AUTH_TOKEN);
 
-    send_all(socket_fd,
-             (unsigned char *)auth_command,
-             strlen(auth_command));
+    if (send_all(socket_fd,
+                 (unsigned char *)auth_command,
+                 strlen(auth_command)) < 0)
+    {
+        close(socket_fd);
+        return 1;
+    }
 
     char response[BUFFER_SIZE];
 
@@ -377,11 +549,14 @@ int main(void)
                          sizeof(response)) < 0)
     {
         printf("Agent disconnected.\n");
+
         close(socket_fd);
+
         return 1;
     }
 
-    printf("Agent: %s", response);
+    printf("Agent: %s",
+           response);
 
     /*
      * Interactive command loop.
@@ -400,15 +575,20 @@ int main(void)
             break;
         }
 
-        command[strcspn(command, "\n")] = '\0';
+        command[strcspn(command,
+                        "\n")] = '\0';
 
         if (strlen(command) == 0)
+        {
             continue;
+        }
 
         /*
-         * PUT
+         * PUT.
          */
-        if (strncmp(command, "PUT ", 4) == 0)
+        if (strncmp(command,
+                     "PUT ",
+                     4) == 0)
         {
             char filename[256];
 
@@ -435,15 +615,18 @@ int main(void)
                 break;
             }
 
-            printf("Agent: %s", response);
+            printf("Agent: %s",
+                   response);
 
             continue;
         }
 
         /*
-         * GET
+         * GET.
          */
-        if (strncmp(command, "GET ", 4) == 0)
+        if (strncmp(command,
+                    "GET ",
+                    4) == 0)
         {
             char filename[256];
 
@@ -465,9 +648,133 @@ int main(void)
         }
 
         /*
-         * Normal command.
+         * MONITOR START.
          */
-        char command_to_send[BUFFER_SIZE + 2];
+        if (strncmp(command,
+                    "MONITOR START ",
+                    14) == 0)
+        {
+            int udp_port;
+
+            if (sscanf(command + 14,
+                       "%d",
+                       &udp_port) != 1)
+            {
+                printf("Usage: MONITOR START <udp_port>\n");
+                continue;
+            }
+
+            if (udp_port < 1024 ||
+                udp_port > 65535)
+            {
+                printf("Invalid UDP port.\n");
+                continue;
+            }
+
+            /*
+             * Start UDP listener BEFORE
+             * telling Agent to send packets.
+             */
+            if (start_udp_monitor(&monitor,
+                                  udp_port) != 0)
+            {
+                printf("Could not start UDP receiver.\n");
+                continue;
+            }
+
+            printf("Controller UDP port %d ready.\n",
+                   udp_port);
+
+            char monitor_command[128];
+
+            snprintf(monitor_command,
+                     sizeof(monitor_command),
+                     "MONITOR START %d\n",
+                     udp_port);
+
+            if (send_all(socket_fd,
+                         (unsigned char *)monitor_command,
+                         strlen(monitor_command)) < 0)
+            {
+                stop_udp_monitor(&monitor);
+
+                printf("Failed to send MONITOR START.\n");
+
+                break;
+            }
+
+            if (receive_response(socket_fd,
+                                 response,
+                                 sizeof(response)) < 0)
+            {
+                stop_udp_monitor(&monitor);
+
+                printf("Agent disconnected.\n");
+
+                break;
+            }
+
+            printf("Agent: %s",
+                   response);
+
+            /*
+             * If Agent rejected the command,
+             * stop local UDP receiver.
+             */
+            if (strncmp(response,
+                         "OK MONITOR_STARTED",
+                        18) != 0)
+            {
+                stop_udp_monitor(&monitor);
+            }
+
+            continue;
+        }
+
+        /*
+         * MONITOR STOP.
+         */
+        if (strcmp(command,
+                   "MONITOR STOP") == 0)
+        {
+            char monitor_command[] =
+                "MONITOR STOP\n";
+
+            if (send_all(socket_fd,
+                         (unsigned char *)monitor_command,
+                         strlen(monitor_command)) < 0)
+            {
+                printf("Failed to send MONITOR STOP.\n");
+                break;
+            }
+
+            if (receive_response(socket_fd,
+                                 response,
+                                 sizeof(response)) < 0)
+            {
+                printf("Agent disconnected.\n");
+                break;
+            }
+
+            printf("Agent: %s",
+                   response);
+
+            if (strncmp(response,
+                        "OK MONITOR_STOPPED",
+                        18) == 0)
+            {
+                stop_udp_monitor(&monitor);
+            }
+
+            continue;
+        }
+
+        /*
+         * Normal TCP command.
+         */
+        char command_to_send[
+            BUFFER_SIZE + 2
+        ];
 
         snprintf(command_to_send,
                  sizeof(command_to_send),
@@ -493,10 +800,22 @@ int main(void)
             break;
         }
 
-        printf("Agent: %s", response);
+        printf("Agent: %s",
+               response);
 
-        if (strcmp(command, "QUIT") == 0)
+        if (strcmp(command,
+                   "QUIT") == 0)
+        {
             break;
+        }
+    }
+
+    /*
+     * Stop UDP monitoring if still active.
+     */
+    if (monitor.running)
+    {
+        stop_udp_monitor(&monitor);
     }
 
     close(socket_fd);
